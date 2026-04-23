@@ -32,5 +32,12 @@ fi
 # --- Build ---
 cd "$REPO_DIR"
 npm ci
+
+# Xcode Cloud's network only allows Apple/GitHub hosts by default; index.crates.io
+# (Fastly CDN) is blocked. Switch Cargo to the git-based crates.io index on GitHub,
+# which is accessible. CARGO_NET_GIT_FETCH_WITH_CLI avoids libgit2 auth quirks.
+export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 # Xcode Cloud sets CI=TRUE (uppercase); Tauri's CLI only accepts lowercase true/false.
 CI=true npm run tauri build
