@@ -1,22 +1,35 @@
 #!/usr/bin/env bash
-# Xcode Cloud post-clone hook — installs Rust + Node, then builds Tauri.
+# Xcode Cloud post-clone hook — installs toolchain, fetches sibling dep, builds Tauri.
 set -euo pipefail
 
-# Rust
-if ! command -v rustup &>/dev/null; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --default-toolchain stable
-fi
-# shellcheck disable=SC1091
-source "$HOME/.cargo/env"
+REPO_DIR="/Volumes/workspace/repository"
+WORKSPACE_DIR="/Volumes/workspace"
 
-# Node (use system install; fall back to nvm)
+# --- Rust ---
+# The rustup curl installer can't resolve DNS in Xcode Cloud; use Homebrew instead.
+if ! command -v rustc &>/dev/null; then
+    brew install rust
+fi
+
+# --- Node.js ---
 if ! command -v node &>/dev/null; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-    # shellcheck disable=SC1091
-    source "$HOME/.nvm/nvm.sh"
-    nvm install --lts
+    brew install node
 fi
 
+# --- Sibling repo: imessage-exporter fork ---
+# Cargo.toml has a path dep: path = "../../imessage-exporter/imessage-database"
+# Relative to src-tauri/ that resolves to /Volumes/workspace/imessage-exporter/.
+EXPORTER_DIR="$WORKSPACE_DIR/imessage-exporter"
+if [ ! -d "$EXPORTER_DIR" ]; then
+    # Derive the GitHub user from this repo's origin URL (works for both HTTPS and SSH remotes).
+    ORIGIN=$(git -C "$REPO_DIR" remote get-url origin)
+    GITHUB_USER=$(echo "$ORIGIN" | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|')
+    git clone --depth 1 --branch develop \
+        "https://github.com/$GITHUB_USER/imessage-exporter.git" \
+        "$EXPORTER_DIR"
+fi
+
+# --- Build ---
+cd "$REPO_DIR"
 npm ci
 npm run tauri build
