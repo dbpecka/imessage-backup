@@ -32,4 +32,5 @@ fi
 # --- Build ---
 cd "$REPO_DIR"
 npm ci
-npm run tauri build
+# Xcode Cloud sets CI=TRUE (uppercase); Tauri's CLI only accepts lowercase true/false.
+CI=true npm run tauri build
