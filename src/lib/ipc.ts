@@ -1,5 +1,55 @@
 import { invoke } from '@tauri-apps/api/core';
 
+/**
+ * Tagged error payload emitted by the Rust backend. Mirrors the
+ * `AppError` enum in src-tauri/src/error.rs (`#[serde(tag = "kind", content = "data")]`).
+ */
+export type AppError =
+  | { kind: 'database'; data: string }
+  | { kind: 'fullDiskAccess'; data: { path: string } }
+  | { kind: 'io'; data: string }
+  | { kind: 'other'; data: string };
+
+export function isAppError(err: unknown): err is AppError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'kind' in err &&
+    typeof (err as { kind: unknown }).kind === 'string'
+  );
+}
+
+export function isFdaError(err: unknown): boolean {
+  return isAppError(err) && err.kind === 'fullDiskAccess';
+}
+
+/**
+ * Human-friendly message for UI surfaces. Per-kind copy sits here so the
+ * Rust side can stay terse and the UI can polish the edges without regex.
+ */
+export function appErrorMessage(err: unknown): string {
+  if (!isAppError(err)) return String(err);
+  switch (err.kind) {
+    case 'database':
+      // Sqlite errors arrive verbose ("SqliteFailure(Error { code: ... })").
+      // Strip the wrapper the Rust crate normally adds so the message reads
+      // cleanly in a toast.
+      return `Database error: ${stripSqliteFailurePrefix(err.data)}`;
+    case 'fullDiskAccess':
+      return `Full Disk Access is required. Grant access to BubbleWrap in System Settings → Privacy & Security → Full Disk Access.`;
+    case 'io':
+      return `File system error: ${err.data}`;
+    case 'other':
+      return err.data;
+  }
+}
+
+function stripSqliteFailurePrefix(msg: string): string {
+  // rusqlite formats as "SqliteFailure(<code>) <message>" — keep the message.
+  const match = msg.match(/^SqliteFailure\([^)]*\)\s*(.*)$/);
+  return match ? match[1] : msg;
+}
+
 export type FdaStatus = {
   granted: boolean;
   path: string;
@@ -93,8 +143,12 @@ export type RunDeleteArgs = {
   filter: FilterSpec;
   confirmationPhrase: string;
   backupVerified?: boolean;
+  /** Required by the backend when backupVerified is false. */
+  acknowledgeSkipBackup?: boolean;
   snapshotRoot?: string;
   deleteScope?: DeleteScope;
+  /** Must be true when Messages in iCloud is enabled. Required by the backend. */
+  acknowledgeIcloudSync?: boolean;
 };
 
 export type DeleteResult = {

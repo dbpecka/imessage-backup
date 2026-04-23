@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use imessage_database::{
     exporters::{
+        attachments::copy_attachments,
         config::{AttachmentMode, ExportConfig},
         export_type::ExportType,
         json::run_json_export,
@@ -55,10 +54,7 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
 
     let db_path = default_chat_db_path()?;
-    let destination = PathBuf::from(&args.destination);
-    if destination.as_os_str().is_empty() {
-        return Err(AppError::Other("destination is required".into()));
-    }
+    let destination = crate::core::paths::validate_user_path(&args.destination, "destination")?;
 
     let config = ExportConfig {
         db_path,
@@ -94,12 +90,18 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     })
                 }
                 ExportType::Pdf => {
+                    // Copy attachment files into {export}/attachments/<chat_id>/
+                    // using the same helper JSON uses, so the PDF run leaves a
+                    // browsable attachment archive next to the PDF.
+                    let att_bytes = copy_attachments(&config, &progress)
+                        .map_err(|e| AppError::Other(format!("attachment copy failed: {e}")))?
+                        .bytes;
                     let summary = run_pdf_export(&config, &progress)
                         .map_err(|e| AppError::Other(e.to_string()))?;
                     Ok(BackupResult {
                         message_count: summary.message_count,
                         attachment_count: summary.attachment_count,
-                        attachment_bytes_copied: 0,
+                        attachment_bytes_copied: att_bytes,
                         conversation_count: summary.conversation_count,
                         manifest_path: String::new(),
                         export_path: config.export_path.display().to_string(),
@@ -112,8 +114,6 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     // it to `ProgressReporter` is a follow-up; for now we
                     // flip the UI into a generic "running" state and emit a
                     // finish event when start() returns.
-                    progress.start(0);
-                    progress.set_message("Running HTML/TXT export…");
 
                     // The library's HTML/TXT runtime doesn't return a summary,
                     // so compute counts from the same filter before running.
@@ -136,6 +136,17 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                         (messages, conversations, attachments)
                     };
 
+                    // Copy attachment files into {export}/attachments/<chat_id>/
+                    // using the same helper JSON uses. The HTML/TXT runtime's
+                    // own AttachmentManager has historically lost files for
+                    // iCloud-offloaded sources and logged noisy "not found"
+                    // output; this pass is the reliable one.
+                    let att_summary = copy_attachments(&config, &progress)
+                        .map_err(|e| AppError::Other(format!("attachment copy failed: {e}")))?;
+
+                    progress.start(0);
+                    progress.set_message("Running HTML/TXT export…");
+
                     let export_path = config.export_path.clone();
                     let options: Options = config.into();
                     let mut runtime = Config::new(options).map_err(|e| {
@@ -149,7 +160,7 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     Ok(BackupResult {
                         message_count,
                         attachment_count,
-                        attachment_bytes_copied: 0,
+                        attachment_bytes_copied: att_summary.bytes,
                         conversation_count,
                         manifest_path: String::new(),
                         export_path: export_path.display().to_string(),

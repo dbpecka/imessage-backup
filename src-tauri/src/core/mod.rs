@@ -4,5 +4,6 @@ pub mod icloud;
 pub mod messages_app;
 #[cfg(target_os = "macos")]
 pub mod contacts;
+pub mod paths;
 pub mod progress;
 pub mod snapshot;

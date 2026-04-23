@@ -17,7 +17,9 @@
     type DeleteResult,
     type DeleteScope,
     type OrphanScan,
-    type OrphanCleanResult
+    type OrphanCleanResult,
+    appErrorMessage,
+    isFdaError
   } from '$lib/ipc';
 
   // FDA (Full Disk Access) gate. The app is unusable without it, so we
@@ -118,6 +120,56 @@
   let orphanResult = $state<OrphanCleanResult | null>(null);
   let orphanError = $state('');
   let unlistenMenuClean: UnlistenFn | null = null;
+  let orphanModalCard = $state<HTMLDivElement | null>(null);
+
+  // Modal can be dismissed by the user only when no destructive work is in
+  // flight. 'cleaning' is a point of no return; 'scanning' is cancel-safe in
+  // principle but the UI doesn't wire a cancellation path, so gate it too.
+  const orphanModalDismissable = $derived(
+    orphanModal === 'preview' || orphanModal === 'done' || orphanModal === 'error'
+  );
+
+  function closeOrphanModal() {
+    if (orphanModalDismissable) orphanModal = null;
+  }
+
+  // Focus trap: keep Tab inside the dialog while it's open and route Escape
+  // to the dismiss path. Autofocus the first actionable control on open.
+  $effect(() => {
+    if (orphanModal === null) return;
+    queueMicrotask(() => {
+      const first = orphanModalCard?.querySelector<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      );
+      first?.focus();
+    });
+  });
+
+  function onOrphanModalKeydown(e: KeyboardEvent) {
+    if (orphanModal === null) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeOrphanModal();
+      return;
+    }
+    if (e.key !== 'Tab' || !orphanModalCard) return;
+    const focusables = Array.from(
+      orphanModalCard.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      )
+    ).filter((el) => !el.hasAttribute('disabled'));
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 
   // delete state
   let deleteExpanded = $state(false);
@@ -131,14 +183,8 @@
   let deleting = $state(false);
   let deleteResult = $state<DeleteResult | null>(null);
   let deleteError = $state('');
-
-  $effect(() => {
-    listen<ProgressPayload>('backup-progress', (e) => {
-      progress = e.payload;
-    }).then((fn) => {
-      unlistenProgress = fn;
-    });
-  });
+  let icloudAcknowledged = $state(false);
+  let skipBackupAcknowledged = $state(false);
 
   let unlistenFocus: UnlistenFn | null = null;
 
@@ -155,6 +201,11 @@
       .then((fn) => {
         unlistenFocus = fn;
       });
+    listen<ProgressPayload>('backup-progress', (e) => {
+      progress = e.payload;
+    }).then((fn) => {
+      unlistenProgress = fn;
+    });
     listen('menu:clean-orphans', startOrphanScan).then((fn) => {
       unlistenMenuClean = fn;
     });
@@ -181,7 +232,7 @@
       }
     } catch (err) {
       fda = 'missing-db';
-      fdaDetail = String(err);
+      fdaDetail = appErrorMessage(err);
     }
   }
 
@@ -190,7 +241,7 @@
     try {
       await api.openFdaSettings();
     } catch (err) {
-      fdaDetail = String(err);
+      fdaDetail = appErrorMessage(err);
     } finally {
       openingSettings = false;
     }
@@ -200,7 +251,7 @@
     try {
       await api.relaunchApp();
     } catch (err) {
-      fdaDetail = String(err);
+      fdaDetail = appErrorMessage(err);
     }
   }
 
@@ -221,18 +272,17 @@
       detail = `${result.messageCount.toLocaleString()} messages found`;
       if (!chats) await loadChats();
     } catch (err) {
-      const msg = String(err);
       // SQLite opens via a different path than File::open, so it can still
       // report FDA denial even when the lightweight check succeeded. Route
       // back to the gate so the user gets the restart prompt.
-      if (msg.toLowerCase().includes('full disk access')) {
+      if (isFdaError(err)) {
         sawDenial = true;
         fda = 'denied';
         status = 'idle';
         return;
       }
       status = 'error';
-      detail = msg;
+      detail = appErrorMessage(err);
     }
   }
 
@@ -241,7 +291,7 @@
     try {
       chats = await api.listChats();
     } catch (err) {
-      detail = String(err);
+      detail = appErrorMessage(err);
     } finally {
       loadingChats = false;
     }
@@ -252,7 +302,7 @@
     try {
       contacts = await api.listContacts();
     } catch (err) {
-      detail = String(err);
+      detail = appErrorMessage(err);
     } finally {
       loadingContacts = false;
     }
@@ -293,7 +343,7 @@
       }
     } catch (err) {
       if (seq === previewSeq) {
-        previewError = String(err);
+        previewError = appErrorMessage(err);
         preview = null;
       }
     } finally {
@@ -316,6 +366,19 @@
     previewTimer = setTimeout(runPreview, 400);
 
     return () => clearTimeout(previewTimer);
+  });
+
+  // When filters change, any prior `runResult` no longer covers the current
+  // selection. Invalidate the backup-verified signal so the delete gate
+  // forces a fresh backup (or an explicit skip ack) that actually matches
+  // what's about to be deleted. This is defense-in-depth — the backend
+  // can't tell if a backup was taken for a different filter.
+  $effect(() => {
+    void startDate;
+    void endDate;
+    void selectedChatIds;
+    runResult = null;
+    skipBackupAcknowledged = false;
   });
 
   async function pickDestination() {
@@ -344,7 +407,7 @@
         copyAttachments
       });
     } catch (err) {
-      runError = String(err);
+      runError = appErrorMessage(err);
     } finally {
       running = false;
     }
@@ -352,21 +415,29 @@
 
   let checkingSafety = $state(false);
 
-  async function refreshSafety() {
+  async function refreshSafety(): Promise<boolean> {
     checkingSafety = true;
     try {
       safety = await api.safetyStatus();
+      return true;
     } catch (err) {
-      deleteError = String(err);
+      deleteError = appErrorMessage(err);
+      safety = null;
+      return false;
     } finally {
       checkingSafety = false;
     }
   }
 
   async function expandDelete() {
-    deleteExpanded = true;
     deleteError = '';
-    await refreshSafety();
+    const ok = await refreshSafety();
+    if (!ok) {
+      // Leave the section collapsed so the error isn't buried under empty
+      // delete UI; refreshSafety() has already populated `deleteError`.
+      return;
+    }
+    deleteExpanded = true;
   }
 
   async function runDeletePreview() {
@@ -378,7 +449,7 @@
       if (seq === deletePreviewSeq) deletePreview = result;
     } catch (err) {
       if (seq === deletePreviewSeq) {
-        deleteError = String(err);
+        deleteError = appErrorMessage(err);
         deletePreview = null;
       }
     } finally {
@@ -425,7 +496,11 @@
     try {
       // Final safety probe: Messages.app could have reopened between the
       // preview and the click.
-      await refreshSafety();
+      const safetyOk = await refreshSafety();
+      if (!safetyOk) {
+        // refreshSafety already populated deleteError.
+        return;
+      }
       if (safety?.messagesRunning) {
         deleteError =
           'The Messages app is running again — quit it and click Re-check before retrying.';
@@ -435,11 +510,15 @@
         filter: buildFilter(),
         confirmationPhrase: 'DELETE',
         backupVerified: runResult !== null,
-        deleteScope
+        acknowledgeSkipBackup: runResult !== null || skipBackupAcknowledged,
+        deleteScope,
+        // Surface the iCloud risk to the backend so it can refuse if detection
+        // flipped to Enabled since the user ticked the acknowledgement box.
+        acknowledgeIcloudSync: safety?.icloudMessages !== 'enabled' || icloudAcknowledged
       });
       await Promise.all([runPreview(), runDeletePreview(), loadChats()]);
     } catch (err) {
-      deleteError = String(err);
+      deleteError = appErrorMessage(err);
     } finally {
       deleting = false;
     }
@@ -462,7 +541,7 @@
       orphanScan = await api.scanOrphans();
       orphanModal = 'preview';
     } catch (err) {
-      orphanError = String(err);
+      orphanError = appErrorMessage(err);
       orphanModal = 'error';
     }
   }
@@ -474,7 +553,7 @@
       orphanResult = await api.cleanOrphans();
       orphanModal = 'done';
     } catch (err) {
-      orphanError = String(err);
+      orphanError = appErrorMessage(err);
       orphanModal = 'error';
     }
   }
@@ -493,6 +572,8 @@
         (deleteAttachments && deletePreview.attachmentCount > 0)) &&
       safety !== null &&
       !safety.messagesRunning &&
+      (safety.icloudMessages !== 'enabled' || icloudAcknowledged) &&
+      (runResult !== null || skipBackupAcknowledged) &&
       !deleting
   );
 
@@ -605,7 +686,13 @@
       <label class:date-invalid={!!startDateParsed.error}>
         Start date
         <div class="date-wrap">
-          <input type="text" placeholder="YYYY-MM-DD" bind:value={startDate} />
+          <input
+            type="text"
+            placeholder="YYYY, YYYY-MM, or YYYY-MM-DD"
+            bind:value={startDate}
+            aria-describedby={startDateParsed.error ? 'start-date-err' : undefined}
+            aria-invalid={!!startDateParsed.error}
+          />
           <span class="cal-icon" aria-hidden="true">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
               <rect x="0.6" y="2.6" width="12.8" height="10.8" rx="1.4" stroke="currentColor" stroke-width="1.2"/>
@@ -613,20 +700,19 @@
               <path d="M4.5 0.5v2.5M9.5 0.5v2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
             </svg>
           </span>
-          <input
-            type="date"
-            class="date-trigger"
-            title="Pick a date"
-            value={startDateParsed.resolved}
-            onchange={(e) => { startDate = (e.currentTarget as HTMLInputElement).value; }}
-          />
         </div>
-        {#if startDateParsed.error}<span class="date-err">{startDateParsed.error}</span>{/if}
+        {#if startDateParsed.error}<span id="start-date-err" class="date-err">{startDateParsed.error}</span>{/if}
       </label>
       <label class:date-invalid={!!(endDateParsed.error || endDateOrderError)}>
         End date
         <div class="date-wrap">
-          <input type="text" placeholder="YYYY-MM-DD" bind:value={endDate} />
+          <input
+            type="text"
+            placeholder="YYYY, YYYY-MM, or YYYY-MM-DD"
+            bind:value={endDate}
+            aria-describedby={endDateParsed.error || endDateOrderError ? 'end-date-err' : undefined}
+            aria-invalid={!!(endDateParsed.error || endDateOrderError)}
+          />
           <span class="cal-icon" aria-hidden="true">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
               <rect x="0.6" y="2.6" width="12.8" height="10.8" rx="1.4" stroke="currentColor" stroke-width="1.2"/>
@@ -634,15 +720,8 @@
               <path d="M4.5 0.5v2.5M9.5 0.5v2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
             </svg>
           </span>
-          <input
-            type="date"
-            class="date-trigger"
-            title="Pick a date"
-            value={endDateParsed.resolved}
-            onchange={(e) => { endDate = (e.currentTarget as HTMLInputElement).value; }}
-          />
         </div>
-        {#if endDateParsed.error || endDateOrderError}<span class="date-err">{endDateParsed.error || endDateOrderError}</span>{/if}
+        {#if endDateParsed.error || endDateOrderError}<span id="end-date-err" class="date-err">{endDateParsed.error || endDateOrderError}</span>{/if}
       </label>
     </div>
 
@@ -797,10 +876,18 @@
     </div>
 
     {#if progress && !runResult}
-      <div class="progress" role="progressbar" aria-valuenow={progressPct}>
+      <div
+        class="progress"
+        role="progressbar"
+        aria-valuenow={progressPct}
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-describedby="backup-progress-desc"
+        aria-label="Backup progress"
+      >
         <div class="bar" style="width: {progressPct}%"></div>
       </div>
-      <p class="meta">
+      <p id="backup-progress-desc" class="meta">
         {progress.message} · {progress.position.toLocaleString()} / {progress.total.toLocaleString()}
         ({progressPct}%)
       </p>
@@ -875,6 +962,10 @@
           <strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong> if you
           want local-only deletion.
         </p>
+        <label class="checkbox">
+          <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
+          I understand deletes will sync to my other devices and want to proceed anyway.
+        </label>
       {:else if safety?.icloudMessages === 'unknown'}
         <p class="meta">
           Couldn't confirm Messages-in-iCloud state. If it's enabled, deletes will replicate to your
@@ -921,9 +1012,17 @@
 
         {#if !runResult}
           <p class="meta">
-            Tip: run a backup first (Step 4). The delete will still proceed, but without a backup
-            you have no way to restore the data you're about to remove.
+            Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
+            you're about to remove.
           </p>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              bind:checked={skipBackupAcknowledged}
+              disabled={deleting}
+            />
+            I understand and want to delete without a backup.
+          </label>
         {/if}
 
         <div class="actions">
@@ -969,6 +1068,8 @@
 
 {/if}
 
+<svelte:window onkeydown={onOrphanModalKeydown} />
+
 <!-- ─── Orphan-clean modal (triggered by File > Clean Orphaned Data…) ─── -->
 {#if orphanModal !== null}
   <div
@@ -976,12 +1077,9 @@
     role="dialog"
     aria-modal="true"
     aria-label="Clean Orphaned Data"
-    onclick={() => {
-      if (orphanModal === 'preview' || orphanModal === 'done' || orphanModal === 'error')
-        orphanModal = null;
-    }}
+    onclick={closeOrphanModal}
   >
-    <div class="modal-card" onclick={(e) => e.stopPropagation()}>
+    <div class="modal-card" bind:this={orphanModalCard} onclick={(e) => e.stopPropagation()}>
       <h3 class="modal-title">Clean Orphaned Data</h3>
 
       {#if orphanModal === 'scanning'}
@@ -1204,22 +1302,6 @@
     color: var(--text-muted);
     pointer-events: none;
     transition: color 140ms ease;
-  }
-  .date-trigger {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 30px;
-    opacity: 0;
-    cursor: pointer;
-    border: none;
-    background: none;
-    padding: 0;
-    box-shadow: none;
-  }
-  .date-wrap:has(.date-trigger:hover) .cal-icon {
-    color: var(--accent);
   }
   .date-err {
     font-size: 11px;

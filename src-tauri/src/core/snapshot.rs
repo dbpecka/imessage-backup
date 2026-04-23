@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rusqlite::{Connection, OpenFlags, backup::Backup};
+
 use crate::error::AppError;
 
 /// Result of snapshotting `chat.db` to a safety folder before a destructive
@@ -16,14 +18,11 @@ pub struct Snapshot {
     pub copied: Vec<PathBuf>,
 }
 
-/// Copy `chat.db` plus its `-wal` and `-shm` sidecars into a timestamped
-/// folder under `snapshot_root`. The `.db` file itself is required to exist;
-/// the sidecars are copied only if present (they may be absent if the WAL
-/// was checkpointed recently or if journaling isn't WAL mode).
-///
-/// Does **not** checkpoint the WAL. Call
-/// [`checkpoint_wal`](checkpoint_wal) against the source DB first if you
-/// want the snapshot to be self-contained.
+/// Snapshot `chat.db` atomically into a timestamped folder under
+/// `snapshot_root` using SQLite's online backup API. The backup holds a
+/// shared lock on the source, so the resulting single-file `chat.db` is a
+/// consistent point-in-time image regardless of WAL state — no need to
+/// copy `-wal`/`-shm` sidecars or to pre-checkpoint.
 pub fn snapshot_chat_db(chat_db: &Path, snapshot_root: &Path) -> Result<Snapshot, AppError> {
     if !chat_db.exists() {
         return Err(AppError::Other(format!(
@@ -36,40 +35,47 @@ pub fn snapshot_chat_db(chat_db: &Path, snapshot_root: &Path) -> Result<Snapshot
     let dir = snapshot_root.join(timestamp);
     fs::create_dir_all(&dir)?;
 
-    let mut copied = Vec::new();
-
-    // Main database file — mandatory.
     let db_dest = dir.join("chat.db");
-    fs::copy(chat_db, &db_dest).map_err(|e| {
+
+    let src = Connection::open_with_flags(
+        chat_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
         AppError::Other(format!(
-            "failed to copy {} to {}: {e}",
-            chat_db.display(),
+            "failed to open {} for snapshot: {e}",
+            chat_db.display()
+        ))
+    })?;
+
+    let mut dst = Connection::open(&db_dest).map_err(|e| {
+        AppError::Other(format!(
+            "failed to create snapshot at {}: {e}",
             db_dest.display()
         ))
     })?;
-    copied.push(db_dest);
 
-    // Sidecars — best-effort.
-    for sidecar in ["chat.db-wal", "chat.db-shm"] {
-        let src = chat_db.with_file_name(sidecar);
-        if src.exists() {
-            let dst = dir.join(sidecar);
-            if let Err(e) = fs::copy(&src, &dst) {
-                // Don't fail the whole snapshot for a sidecar; surface it
-                // by leaving the file out of `copied`.
-                eprintln!("warning: failed to copy {}: {e}", src.display());
-            } else {
-                copied.push(dst);
-            }
-        }
+    {
+        let backup = Backup::new(&src, &mut dst)
+            .map_err(|e| AppError::Other(format!("failed to init online backup: {e}")))?;
+        backup
+            .run_to_completion(1024, std::time::Duration::from_millis(0), None)
+            .map_err(|e| AppError::Other(format!("online backup failed: {e}")))?;
     }
 
-    Ok(Snapshot { dir, copied })
+    drop(src);
+    drop(dst);
+
+    Ok(Snapshot {
+        dir,
+        copied: vec![db_dest],
+    })
 }
 
-/// Run `PRAGMA wal_checkpoint(TRUNCATE)` against `chat_db` so a subsequent
-/// file-copy snapshot includes all committed data. Opens its own read/write
-/// connection for this single operation and closes it immediately.
+/// Run `PRAGMA wal_checkpoint(TRUNCATE)` against `chat_db`. Retained as a
+/// defensive pre-step so readers of the *source* database find a clean WAL;
+/// the snapshot itself no longer depends on it (we use the SQLite backup
+/// API, which is WAL-safe).
 pub fn checkpoint_wal(chat_db: &Path) -> Result<(), AppError> {
     use imessage_database::tables::table::get_writable_connection;
     let conn = get_writable_connection(chat_db)
@@ -85,4 +91,71 @@ pub fn default_snapshot_root() -> Result<PathBuf, AppError> {
     let home = std::env::var("HOME")
         .map_err(|_| AppError::Other("HOME environment variable is not set".into()))?;
     Ok(PathBuf::from(home).join("Documents/iMessage Backups/snapshots"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    /// Build a minimal SQLite db with a single row. Used only in tests —
+    /// never touches the real chat.db.
+    fn make_fixture_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT);
+             INSERT INTO message (text) VALUES ('hello'), ('world');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn snapshot_round_trips_row_counts() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("chat.db");
+        make_fixture_db(&src);
+
+        let snap_root = tmp.path().join("snaps");
+        let snap = snapshot_chat_db(&src, &snap_root).unwrap();
+
+        let snap_db = snap.dir.join("chat.db");
+        assert!(snap_db.exists(), "snapshot db file should exist");
+
+        let conn = Connection::open(&snap_db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn snapshot_is_isolated_from_source_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("chat.db");
+        make_fixture_db(&src);
+
+        let snap = snapshot_chat_db(&src, &tmp.path().join("snaps")).unwrap();
+
+        // Mutate the source after snapshot — snapshot must not change.
+        let w = Connection::open(&src).unwrap();
+        w.execute("DELETE FROM message", []).unwrap();
+        drop(w);
+
+        let conn = Connection::open(snap.dir.join("chat.db")).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "snapshot should preserve the pre-delete state");
+    }
+
+    #[test]
+    fn snapshot_missing_source_errors() {
+        let tmp = TempDir::new().unwrap();
+        let err = snapshot_chat_db(&tmp.path().join("nope.db"), tmp.path()).unwrap_err();
+        match err {
+            AppError::Other(m) => assert!(m.contains("not found")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

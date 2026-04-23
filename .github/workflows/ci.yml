@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check + clippy + test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # imessage-database is a sibling path dep (../../imessage-exporter).
+      # We check out the fork into that expected layout so cargo resolves
+      # the dep the same way it does locally.
+      - name: Check out imessage-exporter fork
+        uses: actions/checkout@v4
+        with:
+          repository: dbpecka/imessage-exporter
+          ref: develop
+          path: imessage-exporter-checkout
+
+      - name: Restage sibling layout
+        run: |
+          mv imessage-exporter-checkout ../imessage-exporter
+          ls -la ../imessage-exporter
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install system deps
+        run: brew install webkit2gtk || true
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+  frontend:
+    name: svelte-check + type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check

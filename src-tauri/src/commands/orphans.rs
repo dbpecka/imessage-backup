@@ -206,12 +206,16 @@ pub async fn clean_orphans() -> Result<OrphanCleanResult, AppError> {
     // Phase 3: remove DB orphan files from disk.
     let mut db_files_removed = 0u64;
     let mut db_files_failed = 0u64;
-    for path_opt in &db_orphan_paths {
-        if let Some(path) = path_opt {
-            if path.exists() {
-                match fs::remove_file(path) {
-                    Ok(()) => db_files_removed += 1,
-                    Err(_) => db_files_failed += 1,
+    for path in db_orphan_paths.iter().flatten() {
+        if path.exists() {
+            match fs::remove_file(path) {
+                Ok(()) => db_files_removed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "orphan-clean: failed to remove db-orphan file {}: {e}",
+                        path.display()
+                    );
+                    db_files_failed += 1;
                 }
             }
         }
@@ -223,7 +227,13 @@ pub async fn clean_orphans() -> Result<OrphanCleanResult, AppError> {
     for path in &fs_orphan_paths {
         match fs::remove_file(path) {
             Ok(()) => fs_files_removed += 1,
-            Err(_) => fs_files_failed += 1,
+            Err(e) => {
+                eprintln!(
+                    "orphan-clean: failed to remove fs-orphan file {}: {e}",
+                    path.display()
+                );
+                fs_files_failed += 1;
+            }
         }
     }
 

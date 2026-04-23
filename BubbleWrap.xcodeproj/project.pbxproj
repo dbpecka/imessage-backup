@@ -1,0 +1,184 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXFileReference section */
+		B88ACAFE0000000000000004 /* Bubble Wrap.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Bubble Wrap.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		B88ACAFE0000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				B88ACAFE0000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		B88ACAFE0000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B88ACAFE0000000000000004 /* Bubble Wrap.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B88ACAFE0000000000000005 /* BubbleWrap */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B88ACAFE0000000000000008 /* Build configuration list for PBXNativeTarget "BubbleWrap" */;
+			buildPhases = (
+				B88ACAFE0000000000000006 /* Build Tauri App */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BubbleWrap;
+			productName = "Bubble Wrap";
+			productReference = B88ACAFE0000000000000004 /* Bubble Wrap.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B88ACAFE0000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					B88ACAFE0000000000000005 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = B88ACAFE0000000000000007 /* Build configuration list for PBXProject "BubbleWrap" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = B88ACAFE0000000000000002;
+			productRefGroup = B88ACAFE0000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B88ACAFE0000000000000005 /* BubbleWrap */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		B88ACAFE0000000000000006 /* Build Tauri App */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Tauri App";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -euo pipefail\n\nTAURI_APP=\"${SRCROOT}/src-tauri/target/release/bundle/macos/Bubble Wrap.app\"\n\n# In Xcode Cloud, ci_post_clone.sh already ran npm run tauri build before\n# xcodebuild starts. Locally, build on demand if the artifact is missing.\nif [ ! -d \"${TAURI_APP}\" ]; then\n    cd \"${SRCROOT}\"\n    npm ci\n    npm run tauri build\nfi\n\n# Place the Tauri-built bundle where Xcode expects the build product so that\n# subsequent archive / notarization steps find the right path.\nrsync -a --delete \"${TAURI_APP}/\" \"${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B88ACAFE0000000000000009 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		B88ACAFE000000000000000A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		B88ACAFE000000000000000B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = VNU7JJY79M;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "BubbleWrap iMessage Backup";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Derek Pecka. All rights reserved.";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "io.pecka.apps.bubblewrap";
+				PRODUCT_NAME = "Bubble Wrap";
+				SDKROOT = macosx;
+				SKIP_INSTALL = NO;
+			};
+			name = Debug;
+		};
+		B88ACAFE000000000000000C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = VNU7JJY79M;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "BubbleWrap iMessage Backup";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Derek Pecka. All rights reserved.";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "io.pecka.apps.bubblewrap";
+				PRODUCT_NAME = "Bubble Wrap";
+				SDKROOT = macosx;
+				SKIP_INSTALL = NO;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B88ACAFE0000000000000007 /* Build configuration list for PBXProject "BubbleWrap" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B88ACAFE0000000000000009 /* Debug */,
+				B88ACAFE000000000000000A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B88ACAFE0000000000000008 /* Build configuration list for PBXNativeTarget "BubbleWrap" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B88ACAFE000000000000000B /* Debug */,
+				B88ACAFE000000000000000C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = B88ACAFE0000000000000001 /* Project object */;
+}

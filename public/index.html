@@ -13,9 +13,9 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --blue: #007AFF;
-      --blue-mid: #3395FF;
-      --blue-pale: #EBF3FF;
+      --purple: #6B2FE8;
+      --purple-mid: #8A55F8;
+      --purple-pale: #F0EAFF;
       --green: #34C759;
       --green-pale: #E8FAE8;
       --bg: #F7F6F3;
@@ -104,32 +104,32 @@
     }
 
     .btn-primary {
-      background: linear-gradient(140deg, #007AFF, #3AABFF);
+      background: linear-gradient(140deg, #6B2FE8, #9B6BFF);
       color: #fff;
       border-radius: 100px;
       padding: 14px 30px;
       font-size: 1rem;
-      box-shadow: 0 4px 18px rgba(0,122,255,0.32);
+      box-shadow: 0 4px 18px rgba(107,47,232,0.32);
     }
 
     .btn-primary:hover {
       transform: translateY(-2px);
-      box-shadow: 0 8px 28px rgba(0,122,255,0.4);
+      box-shadow: 0 8px 28px rgba(107,47,232,0.4);
     }
 
     .btn-nav {
-      background: var(--blue);
+      background: var(--purple);
       color: #fff;
       border-radius: 100px;
       padding: 8px 20px;
       font-size: 0.875rem;
-      box-shadow: 0 2px 8px rgba(0,122,255,0.25);
+      box-shadow: 0 2px 8px rgba(107,47,232,0.25);
     }
 
     .btn-nav:hover {
-      background: var(--blue-mid);
+      background: var(--purple-mid);
       transform: translateY(-1px);
-      box-shadow: 0 4px 14px rgba(0,122,255,0.35);
+      box-shadow: 0 4px 14px rgba(107,47,232,0.35);
     }
 
     /* ── HERO ── */
@@ -184,7 +184,7 @@
 
     .hero h1 em {
       font-style: italic;
-      color: var(--blue);
+      color: var(--purple);
     }
 
     .hero-sub {
@@ -264,7 +264,7 @@
     }
 
     .bub.out {
-      background: var(--blue);
+      background: var(--purple);
       color: #fff;
       align-self: flex-end;
       border-bottom-right-radius: 5px;
@@ -289,7 +289,7 @@
     }
 
     .chat-result {
-      background: linear-gradient(135deg, #EBF3FF, #E9FAF0);
+      background: linear-gradient(135deg, #EDE6FF, #E9FAF0);
       margin: 12px 14px 14px;
       border-radius: 16px;
       padding: 13px 14px;
@@ -314,7 +314,7 @@
       margin-bottom: 3px;
     }
 
-    .res-row strong { color: var(--blue); font-weight: 600; }
+    .res-row strong { color: var(--purple); font-weight: 600; }
 
     /* floating blobs */
     .blob {
@@ -326,7 +326,7 @@
 
     .blob-1 {
       width: 90px; height: 90px;
-      background: var(--blue);
+      background: var(--purple);
       top: -24px; right: 8px;
       animation: drift 7s ease-in-out infinite;
     }
@@ -340,7 +340,7 @@
 
     .blob-3 {
       width: 32px; height: 32px;
-      background: var(--blue);
+      background: var(--purple);
       top: 42%; left: -18px;
       animation: drift 6s ease-in-out infinite 0.8s;
     }
@@ -365,7 +365,7 @@
       font-weight: 600;
       letter-spacing: 0.13em;
       text-transform: uppercase;
-      color: var(--blue);
+      color: var(--purple);
       margin-bottom: 12px;
     }
 
@@ -409,7 +409,7 @@
     .feat-card:hover {
       transform: translateY(-5px) scale(1.01);
       box-shadow: var(--shadow-md);
-      border-color: rgba(0,122,255,0.18);
+      border-color: rgba(107,47,232,0.18);
     }
 
     .feat-icon {
@@ -423,7 +423,7 @@
       margin-bottom: 18px;
     }
 
-    .ic-blue   { background: var(--blue-pale); }
+    .ic-blue   { background: var(--purple-pale); }
     .ic-green  { background: var(--green-pale); }
     .ic-amber  { background: #FFF8E7; }
     .ic-rose   { background: #FFE9F0; }
@@ -466,7 +466,7 @@
       font-size: 5.5rem;
       font-weight: 700;
       line-height: 1;
-      color: var(--blue);
+      color: var(--purple);
       opacity: 0.1;
       margin-bottom: -10px;
       user-select: none;
@@ -497,7 +497,7 @@
 
     /* ── SAFETY ── */
     .safety-section {
-      background: linear-gradient(140deg, #EBF4FF 0%, #E9FAF0 100%);
+      background: linear-gradient(140deg, #EDE6FF 0%, #E9FAF0 100%);
       position: relative;
       overflow: hidden;
     }
@@ -506,7 +506,7 @@
       content: '';
       position: absolute;
       inset: 0;
-      background-image: radial-gradient(circle, rgba(0,122,255,0.055) 1.5px, transparent 1.5px);
+      background-image: radial-gradient(circle, rgba(107,47,232,0.07) 1.5px, transparent 1.5px);
       background-size: 30px 30px;
       pointer-events: none;
     }
@@ -521,14 +521,14 @@
     .shield-icon {
       width: 84px;
       height: 84px;
-      background: linear-gradient(140deg, #007AFF, #5AC8FA);
+      background: linear-gradient(140deg, #6B2FE8, #9B6BFF);
       border-radius: 26px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 38px;
       margin: 0 auto 30px;
-      box-shadow: 0 10px 36px rgba(0,122,255,0.26);
+      box-shadow: 0 10px 36px rgba(107,47,232,0.26);
       transform: rotate(-4deg);
       transition: transform 0.35s cubic-bezier(.34,1.56,.64,1);
     }
@@ -558,7 +558,7 @@
       font-family: var(--ff-display);
       font-weight: 700;
       font-size: 0.8rem;
-      color: var(--blue);
+      color: var(--purple);
       letter-spacing: 0.06em;
       margin-bottom: 6px;
     }
@@ -681,8 +681,8 @@
         <span class="badge-dot"></span>
         Free for macOS
       </div>
-      <h1>Your iMessages,<br><em>safely wrapped.</em></h1>
-      <p class="hero-sub">Back up years of conversations, photos, and attachments — then reclaim gigabytes of disk space — with a simple, step-by-step process that never deletes anything without your full approval.</p>
+      <h1>Your iMessages,<br><em>all wrapped up.</em></h1>
+      <p class="hero-sub">Back up years of conversations, photos, and attachments — <strong>then reclaim gigabytes of disk space</strong> — with a simple, step-by-step process.</p>
       <div class="hero-cta">
         <a href="#download" class="btn btn-primary">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">

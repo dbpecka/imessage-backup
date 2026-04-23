@@ -74,7 +74,7 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
     #[cfg(target_os = "macos")]
     let contact_map = tokio::task::spawn_blocking(crate::core::contacts::fetch_contact_map)
         .await
-        .unwrap_or_default();
+        .map_err(|e| AppError::Other(format!("contact lookup task failed: {e}")))?;
 
     let path = default_chat_db_path()?;
     let conn = get_connection(&path)?;

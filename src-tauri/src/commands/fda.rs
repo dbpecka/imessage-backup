@@ -34,7 +34,7 @@ pub async fn check_fda() -> Result<FdaStatus, AppError> {
             granted: false,
             path: path_str,
         }),
-        Err(e) => Err(AppError::Io(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -45,7 +45,7 @@ pub fn open_fda_settings() -> Result<(), AppError> {
     Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
         .spawn()
-        .map_err(AppError::Io)?;
+        .map_err(AppError::from)?;
     Ok(())
 }
 

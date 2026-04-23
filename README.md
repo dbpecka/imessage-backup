@@ -63,12 +63,14 @@ A **File > Clean Orphaned Data…** menu item opens a modal that scans for and r
 `run_delete` enforces these steps in order before touching any data:
 
 1. Typed confirmation phrase must equal `"DELETE"`
-2. `pgrep -x Messages` must return empty (Messages.app must be closed)
-3. `PRAGMA wal_checkpoint(TRUNCATE)` flushes the WAL to the main file
-4. File-copy snapshot of `chat.db` + `-wal`/`-shm` sidecars written to `~/Documents/iMessage Backups/snapshots/<ISO-timestamp>/`
-5. Delete plan built on a read-only connection, then applied on a separate writable connection
-6. Writable connection released immediately after commit
-7. Attachment files unlinked after the SQL transaction; failures are counted but non-fatal
+2. `backup_verified=true` OR explicit `acknowledge_skip_backup=true`
+3. `pgrep -x Messages` must return empty (Messages.app must be closed)
+4. If Messages-in-iCloud is detected as **Enabled**, `acknowledge_icloud_sync=true` is required
+5. `PRAGMA wal_checkpoint(TRUNCATE)` flushes the WAL on the source DB
+6. Atomic snapshot of `chat.db` via SQLite's online backup API written to `~/Documents/iMessage Backups/snapshots/<ISO-timestamp>/`
+7. Delete plan built on a read-only connection, then applied on a separate writable connection
+8. Writable connection released immediately after commit
+9. Attachment files unlinked after the SQL transaction; failures are logged to stderr with path + reason but are non-fatal
 
 ### Contact name resolution
 
@@ -101,6 +103,20 @@ iCloud Messages sync state is detected via `defaults read com.apple.Messages ICl
 ```sh
 npm install
 npm run tauri dev
+```
+
+### Checks
+
+Before pushing, run the same suite CI runs:
+
+```sh
+# Rust side
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+# Frontend side
+npm run check
 ```
 
 ### Build

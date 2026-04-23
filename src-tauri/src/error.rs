@@ -1,9 +1,11 @@
 use serde::Serialize;
 use thiserror::Error;
 
-/// App-level errors surfaced to the Tauri frontend. Serde-serializable so
-/// `Result<T, AppError>` works as a `#[tauri::command]` return type.
-#[derive(Debug, Error)]
+/// App-level errors surfaced to the Tauri frontend. Serialised as a tagged
+/// JSON enum (`{"kind": "...", "data": ...}`) so the frontend can branch on
+/// kind without regex-matching message strings.
+#[derive(Debug, Error, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum AppError {
     #[error("database error: {0}")]
     Database(String),
@@ -12,18 +14,15 @@ pub enum AppError {
     FullDiskAccess { path: String },
 
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     #[error("{0}")]
     Other(String),
 }
 
-impl Serialize for AppError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
+impl From<std::io::Error> for AppError {
+    fn from(value: std::io::Error) -> Self {
+        AppError::Io(value.to_string())
     }
 }
 

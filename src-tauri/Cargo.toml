@@ -30,8 +30,18 @@ chrono = "0.4"
 
 # Library crate from the sibling repository. Uses path dep against the user's
 # fork (dbpecka/imessage-exporter); features are added as the app grows.
+#
+# TODO(C3): once the Phase 5b vendoring is committed in the fork, add a
+# pinned `git` + `rev` (or a versioned `version = "x.y"`) alongside `path`
+# so reproducible builds don't silently change when the fork's working tree
+# moves. Today the fork's develop branch HEAD (b60ecc9) predates the
+# vendored `exporters` and `write` modules this app requires, so there is
+# no rev to pin — pinning is blocked on committing the fork first.
 imessage-database = { path = "../../imessage-exporter/imessage-database", features = ["export", "write"] }
-rusqlite = "0.39"
+rusqlite = { version = "0.39", features = ["backup"] }
+
+[dev-dependencies]
+tempfile = "3.12"
 
 
 [profile.release]
