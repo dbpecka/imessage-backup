@@ -1,0 +1,42 @@
+[package]
+name = "imessage-backup"
+version = "0.1.0"
+edition = "2021"
+description = "macOS app for iMessage backup, attachment extraction, and selective deletion"
+authors = ["Derek Pecka <derek@pecka.io>"]
+publish = false
+
+[lib]
+name = "imessage_backup_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "imessage-backup"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.1", features = [] }
+tauri-plugin-dialog = "2.2"
+tauri-plugin-shell = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-util = "0.7"
+chrono = "0.4"
+
+# Library crate from the sibling repository. Uses path dep against the user's
+# fork (dbpecka/imessage-exporter); features are added as the app grows.
+imessage-database = { path = "../../imessage-exporter/imessage-database", features = ["export", "write"] }
+rusqlite = "0.39"
+
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

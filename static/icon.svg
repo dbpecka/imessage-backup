@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="0.35" cy="0.3" r="0.95">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset="0.45" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#3B1E80"/>
+    </radialGradient>
+
+    <radialGradient id="dimple" cx="0.32" cy="0.28" r="0.95">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.2" stop-color="#F4EEFF"/>
+      <stop offset="0.55" stop-color="#D4C4FB"/>
+      <stop offset="0.85" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#4C1D95"/>
+    </radialGradient>
+
+    <radialGradient id="poppedDimple" cx="0.7" cy="0.75" r="0.75">
+      <stop offset="0" stop-color="#5B36B0"/>
+      <stop offset="0.6" stop-color="#311680"/>
+      <stop offset="1" stop-color="#1A0A52"/>
+    </radialGradient>
+
+    <radialGradient id="poppedRim" cx="0.7" cy="0.7" r="0.55">
+      <stop offset="0.82" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.94" stop-color="#B9A3F0" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="highlight" cx="0.3" cy="0.25" r="0.4">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="dropShadow" x="-0.5" y="-0.3" width="2" height="1.9">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dy="18"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="innerSoft" x="-0.2" y="-0.2" width="1.4" height="1.4">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dy="4"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.55"/></feComponentTransfer>
+      <feComposite in2="SourceAlpha" operator="in"/>
+      <feMerge>
+        <feMergeNode in="SourceGraphic"/>
+        <feMergeNode/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="url(#bg)"/>
+
+  <g filter="url(#dropShadow)">
+    <circle cx="264" cy="264" r="116" fill="url(#dimple)"/>
+    <circle cx="512" cy="264" r="116" fill="url(#dimple)"/>
+    <circle cx="760" cy="264" r="116" fill="url(#dimple)"/>
+
+    <circle cx="264" cy="512" r="116" fill="url(#dimple)"/>
+    <circle cx="512" cy="512" r="116" fill="url(#dimple)"/>
+    <circle cx="760" cy="512" r="116" fill="url(#dimple)"/>
+
+    <circle cx="264" cy="760" r="116" fill="url(#dimple)"/>
+    <circle cx="512" cy="760" r="116" fill="url(#dimple)"/>
+  </g>
+
+  <g filter="url(#innerSoft)">
+    <circle cx="760" cy="760" r="116" fill="url(#poppedDimple)"/>
+  </g>
+  <circle cx="760" cy="760" r="116" fill="url(#poppedRim)"/>
+
+  <g>
+    <circle cx="264" cy="264" r="116" fill="url(#highlight)"/>
+    <circle cx="512" cy="264" r="116" fill="url(#highlight)"/>
+    <circle cx="760" cy="264" r="116" fill="url(#highlight)"/>
+    <circle cx="264" cy="512" r="116" fill="url(#highlight)"/>
+    <circle cx="512" cy="512" r="116" fill="url(#highlight)"/>
+    <circle cx="760" cy="512" r="116" fill="url(#highlight)"/>
+    <circle cx="264" cy="760" r="116" fill="url(#highlight)"/>
+    <circle cx="512" cy="760" r="116" fill="url(#highlight)"/>
+  </g>
+
+  <g fill="#FFFFFF" fill-opacity="0.9">
+    <ellipse cx="234" cy="232" rx="22" ry="12" transform="rotate(-38 234 232)"/>
+    <ellipse cx="482" cy="232" rx="22" ry="12" transform="rotate(-38 482 232)"/>
+    <ellipse cx="730" cy="232" rx="22" ry="12" transform="rotate(-38 730 232)"/>
+    <ellipse cx="234" cy="480" rx="22" ry="12" transform="rotate(-38 234 480)"/>
+    <ellipse cx="482" cy="480" rx="22" ry="12" transform="rotate(-38 482 480)"/>
+    <ellipse cx="730" cy="480" rx="22" ry="12" transform="rotate(-38 730 480)"/>
+    <ellipse cx="234" cy="728" rx="22" ry="12" transform="rotate(-38 234 728)"/>
+    <ellipse cx="482" cy="728" rx="22" ry="12" transform="rotate(-38 482 728)"/>
+  </g>
+</svg>

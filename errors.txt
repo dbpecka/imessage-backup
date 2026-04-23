@@ -1,0 +1,12 @@
+
+> imessage-backup@0.1.0 tauri
+> tauri dev
+
+
+> imessage-backup@0.1.0 dev
+> vite dev
+
+
+  VITE v6.4.2  ready in 497 ms
+
+  ➜  Local:   http://localhost:1420/
