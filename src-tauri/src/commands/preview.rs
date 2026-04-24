@@ -55,8 +55,10 @@ pub async fn preview_backup(filter: FilterSpec) -> Result<BackupPreview, AppErro
     }
 
     // Attachments with no resolvable path at all are also missing.
-    let unresolvable =
-        plan.attachment_rowids.len().saturating_sub(plan.attachment_files_on_disk.len()) as u64;
+    let unresolvable = plan
+        .attachment_rowids
+        .len()
+        .saturating_sub(plan.attachment_files_on_disk.len()) as u64;
     missing_count += unresolvable;
 
     Ok(BackupPreview {

@@ -156,8 +156,10 @@ pub async fn clean_orphans() -> Result<OrphanCleanResult, AppError> {
             .collect();
 
         let db_orphan_rowids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
-        let db_orphan_paths: Vec<Option<PathBuf>> =
-            pairs.iter().map(|(_, f)| f.as_deref().map(expand_tilde)).collect();
+        let db_orphan_paths: Vec<Option<PathBuf>> = pairs
+            .iter()
+            .map(|(_, f)| f.as_deref().map(expand_tilde))
+            .collect();
 
         let mut path_stmt =
             conn.prepare("SELECT filename FROM attachment WHERE filename IS NOT NULL")?;

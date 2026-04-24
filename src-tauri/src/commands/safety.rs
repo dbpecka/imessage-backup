@@ -1,4 +1,4 @@
-use crate::core::icloud::{ICloudState, detect_icloud_messages};
+use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::error::AppError;
 use serde::Serialize;

@@ -8,7 +8,10 @@ use crate::error::AppError;
 /// flag "MessagesAgent" or unrelated apps. An absent binary is treated as
 /// "not running" rather than an error.
 pub fn is_messages_running() -> Result<bool, AppError> {
-    let out = match Command::new("/usr/bin/pgrep").args(["-x", "Messages"]).output() {
+    let out = match Command::new("/usr/bin/pgrep")
+        .args(["-x", "Messages"])
+        .output()
+    {
         Ok(o) => o,
         Err(e) => {
             return Err(AppError::Other(format!(
