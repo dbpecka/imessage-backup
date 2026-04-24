@@ -159,7 +159,7 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
         })
         .collect();
 
-    summaries.sort_by(|a, b| b.message_count.cmp(&a.message_count));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.message_count));
     Ok(summaries)
 }
 
