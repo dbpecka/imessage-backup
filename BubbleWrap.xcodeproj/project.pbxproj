@@ -94,7 +94,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "set -euo pipefail\n\nTAURI_APP=\"${SRCROOT}/src-tauri/target/release/bundle/macos/Bubble Wrap.app\"\n\n# In Xcode Cloud, ci_post_clone.sh already ran npm run tauri build before\n# xcodebuild starts. Locally, build on demand if the artifact is missing.\nif [ ! -d \"${TAURI_APP}\" ]; then\n    cd \"${SRCROOT}\"\n    npm ci\n    npm run tauri build\nfi\n\n# Place the Tauri-built bundle where Xcode expects the build product so that\n# subsequent archive / notarization steps find the right path.\nrsync -a --delete \"${TAURI_APP}/\" \"${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/\"\n";
+			shellScript = "set -euo pipefail\n\n# CI builds a universal binary; local native builds land in target/release.\nUNIVERSAL=\"${SRCROOT}/src-tauri/target/universal-apple-darwin/release/bundle/macos/Bubble Wrap.app\"\nNATIVE=\"${SRCROOT}/src-tauri/target/release/bundle/macos/Bubble Wrap.app\"\n\nif [ -d \"${UNIVERSAL}\" ]; then\n    TAURI_APP=\"${UNIVERSAL}\"\nelif [ -d \"${NATIVE}\" ]; then\n    TAURI_APP=\"${NATIVE}\"\nelse\n    cd \"${SRCROOT}\"\n    npm ci\n    npm run tauri build\n    TAURI_APP=\"${NATIVE}\"\nfi\n\n# Place the Tauri-built bundle where Xcode expects the build product.\nrsync -a --delete \"${TAURI_APP}/\" \"${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -118,8 +118,8 @@
 		B88ACAFE000000000000000B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_IDENTITY = "Developer ID Application";
-				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = VNU7JJY79M;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -127,10 +127,11 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "BubbleWrap iMessage Backup";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Derek Pecka. All rights reserved.";
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "io.pecka.apps.bubblewrap";
+				PRODUCT_BUNDLE_IDENTIFIER = io.pecka.apps.bubblewrap;
 				PRODUCT_NAME = "Bubble Wrap";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = macosx;
 				SKIP_INSTALL = NO;
 			};
@@ -139,8 +140,8 @@
 		B88ACAFE000000000000000C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_IDENTITY = "Developer ID Application";
-				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = VNU7JJY79M;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -148,10 +149,11 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "BubbleWrap iMessage Backup";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Derek Pecka. All rights reserved.";
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "io.pecka.apps.bubblewrap";
+				PRODUCT_BUNDLE_IDENTIFIER = io.pecka.apps.bubblewrap;
 				PRODUCT_NAME = "Bubble Wrap";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = macosx;
 				SKIP_INSTALL = NO;
 			};
