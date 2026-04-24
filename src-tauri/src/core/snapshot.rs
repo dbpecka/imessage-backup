@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OpenFlags, backup::Backup};
+use rusqlite::{backup::Backup, Connection, OpenFlags};
 
 use crate::error::AppError;
 

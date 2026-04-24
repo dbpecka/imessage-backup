@@ -3,7 +3,7 @@ use crate::error::AppError;
 use imessage_database::tables::{
     chat::Chat,
     handle::Handle,
-    table::{Cacheable, get_connection},
+    table::{get_connection, Cacheable},
 };
 use serde::Serialize;
 
@@ -115,13 +115,15 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
             .map_err(|e| AppError::Database(e.to_string()))?;
         for r in rows {
             let (chat_id, handle_id) = r.map_err(|e| AppError::Database(e.to_string()))?;
-            participant_handles.entry(chat_id).or_default().push(handle_id);
+            participant_handles
+                .entry(chat_id)
+                .or_default()
+                .push(handle_id);
         }
     }
 
     // Message counts per chat via chat_message_join
-    let mut message_counts: std::collections::HashMap<i32, i64> =
-        std::collections::HashMap::new();
+    let mut message_counts: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
     {
         let mut stmt = conn
             .prepare("SELECT chat_id, COUNT(*) FROM chat_message_join GROUP BY chat_id")

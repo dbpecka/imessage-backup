@@ -16,9 +16,7 @@ pub fn run() {
             let clean_item =
                 MenuItemBuilder::with_id("clean-orphans", "Clean Orphaned Data…").build(app)?;
 
-            let file_menu = SubmenuBuilder::new(app, "File")
-                .item(&clean_item)
-                .build()?;
+            let file_menu = SubmenuBuilder::new(app, "File").item(&clean_item).build()?;
 
             // Build a full macOS menu bar: app-name menu, File, Edit.
             // Without this, set_menu() replaces the system default and loses

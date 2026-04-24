@@ -4,14 +4,14 @@ use imessage_database::tables::{
     table::{get_connection, get_writable_connection},
     write::{
         attachment_filter::AttachmentFilter,
-        delete::{DeletePlan, execute_delete, preview_delete as lib_preview_delete},
+        delete::{execute_delete, preview_delete as lib_preview_delete, DeletePlan},
     },
 };
 use serde::{Deserialize, Serialize};
 
 use crate::core::db_path::default_chat_db_path;
 use crate::core::filter::FilterSpec;
-use crate::core::icloud::{ICloudState, detect_icloud_messages};
+use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::core::snapshot::{checkpoint_wal, default_snapshot_root, snapshot_chat_db};
 use crate::error::AppError;
@@ -53,10 +53,8 @@ pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppErro
     let conn = get_connection(&db_path)?;
     let ctx = filter.to_query_context()?;
 
-    let plan =
-        lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).map_err(|e| {
-            AppError::Database(format!("failed to compute delete plan: {e}"))
-        })?;
+    let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path)
+        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
 
     Ok(DeletePreview {
         message_count: plan.message_rowids.len() as u64,
@@ -154,8 +152,7 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
     // when we can't tell (pgrep unavailable → treat as "could be running").
     if is_messages_running().unwrap_or(true) {
         return Err(AppError::Other(
-            "Quit Messages.app before running a delete — it holds a write lock on chat.db."
-                .into(),
+            "Quit Messages.app before running a delete — it holds a write lock on chat.db.".into(),
         ));
     }
 
@@ -189,10 +186,8 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
     // two writers, and the read-only path is more conservative.
     let read_conn = get_connection(&db_path)?;
     let ctx = args.filter.to_query_context()?;
-    let mut plan =
-        lib_preview_delete(&read_conn, &ctx, &AttachmentFilter::any(), &db_path).map_err(
-            |e| AppError::Database(format!("failed to compute delete plan: {e}")),
-        )?;
+    let mut plan = lib_preview_delete(&read_conn, &ctx, &AttachmentFilter::any(), &db_path)
+        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
     drop(read_conn);
 
     apply_scope(&mut plan, &args.delete_scope);
@@ -252,7 +247,7 @@ mod tests {
     //! `~/Library/Messages/chat.db`.
     use super::*;
     use imessage_database::util::query_context::QueryContext;
-    use rusqlite::{Connection, params};
+    use rusqlite::{params, Connection};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -404,8 +399,7 @@ mod tests {
         let (_tmp, db_path, _att) = fresh_fixture();
         let conn = Connection::open(&db_path).unwrap();
         let ctx = QueryContext::default();
-        let plan =
-            lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
+        let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         assert_eq!(plan.message_rowids.len(), 2);
         assert_eq!(plan.attachment_rowids.len(), 1);
         assert_eq!(plan.attachment_bytes, 15);
@@ -418,8 +412,7 @@ mod tests {
 
         let mut conn = Connection::open(&db_path).unwrap();
         let ctx = QueryContext::default();
-        let plan =
-            lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
+        let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         let report = execute_delete(&mut conn, &plan).unwrap();
         assert_eq!(report.messages_deleted, 2);
         assert_eq!(report.attachments_deleted, 1);
@@ -448,8 +441,7 @@ mod tests {
         let (tmp, db_path, att) = fresh_fixture();
         let mut conn = Connection::open(&db_path).unwrap();
         let ctx = QueryContext::default();
-        let mut plan =
-            lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
+        let mut plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         apply_scope(&mut plan, &DeleteScope::MessagesOnly);
         execute_delete(&mut conn, &plan).unwrap();
 
@@ -478,8 +470,7 @@ mod tests {
         // Execute the delete on the source db.
         let mut conn = Connection::open(&db_path).unwrap();
         let ctx = QueryContext::default();
-        let plan =
-            lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
+        let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         execute_delete(&mut conn, &plan).unwrap();
         drop(conn);
 

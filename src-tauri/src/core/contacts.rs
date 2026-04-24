@@ -70,9 +70,12 @@ fn load_phones(conn: &Connection, map: &mut HashMap<String, String>) {
 
     for row in rows.flatten() {
         let (first, last, nick, org, phone) = row;
-        let Some(name) =
-            build_name(first.as_deref(), last.as_deref(), nick.as_deref(), org.as_deref())
-        else {
+        let Some(name) = build_name(
+            first.as_deref(),
+            last.as_deref(),
+            nick.as_deref(),
+            org.as_deref(),
+        ) else {
             continue;
         };
         let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -109,9 +112,12 @@ fn load_emails(conn: &Connection, map: &mut HashMap<String, String>) {
 
     for row in rows.flatten() {
         let (first, last, nick, org, email) = row;
-        let Some(name) =
-            build_name(first.as_deref(), last.as_deref(), nick.as_deref(), org.as_deref())
-        else {
+        let Some(name) = build_name(
+            first.as_deref(),
+            last.as_deref(),
+            nick.as_deref(),
+            org.as_deref(),
+        ) else {
             continue;
         };
         let email_lower = email.to_lowercase();
@@ -138,7 +144,9 @@ fn build_name(
     if let Some(n) = nick.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(n.to_string());
     }
-    org.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    org.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn phone_lookup_keys(digits: &str) -> Vec<String> {
