@@ -6,10 +6,15 @@ REPO_DIR="/Volumes/workspace/repository"
 WORKSPACE_DIR="/Volumes/workspace"
 
 # --- Rust ---
-# The rustup curl installer can't resolve DNS in Xcode Cloud; use Homebrew instead.
-if ! command -v rustc &>/dev/null; then
-    brew install rust
+# Use Homebrew's rustup formula to avoid the curl installer (DNS is blocked in
+# Xcode Cloud). We need rustup (not the bare rust formula) to add cross-compile
+# targets required for a universal binary.
+if ! command -v rustup &>/dev/null; then
+    brew install rustup
+    rustup-init -y --no-modify-path --default-toolchain stable
 fi
+source "$HOME/.cargo/env"
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 # --- Node.js ---
 if ! command -v node &>/dev/null; then
@@ -40,4 +45,4 @@ export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # Xcode Cloud sets CI=TRUE (uppercase); Tauri's CLI only accepts lowercase true/false.
-CI=true npm run tauri build
+CI=true npm run tauri build -- --target universal-apple-darwin
