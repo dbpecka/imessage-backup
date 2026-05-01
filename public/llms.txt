@@ -1,0 +1,41 @@
+# Bubble Wrap
+
+> A free, open-source macOS app for backing up iMessages and reclaiming disk space.
+
+Bubble Wrap lets Mac users export their iMessage conversations — messages, photos, and attachments — to local files, then optionally delete old messages from the Mac's database to free up storage. No subscription, no account, no cloud. Everything stays on your Mac.
+
+## What it does
+
+- **Export messages**: Save iMessage conversations as HTML pages, PDFs, plain text files, or JSON
+- **Save attachments**: Photos, voice memos, and files are copied to a local folder alongside messages
+- **Filter by date or contact**: Choose any date range and specific conversations to back up
+- **Preview before deleting**: See the exact count of messages and files affected before anything changes
+- **Reclaim disk space**: Remove old messages and attachments from the Mac's Messages database after a successful backup
+- **Real names**: Contacts appear with names from your address book, not raw phone numbers or email addresses
+
+## How it works
+
+1. **Choose what to back up** — Pick a date range, select conversations, and choose a destination folder on your Mac
+2. **Back up your messages** — Bubble Wrap exports conversations and copies all attachments with a live progress bar and full summary
+3. **Optionally clean up** — After a successful backup, delete the old messages from your Mac's database to free space (this step is entirely optional)
+
+## Safety model
+
+Bubble Wrap uses a three-step safety process before any deletion runs:
+
+1. **Preview first** — Shows the exact count of messages and files that will be affected
+2. **Automatic snapshot** — Saves a complete copy of the Messages database to your Documents folder
+3. **Typed confirmation** — Requires you to type a confirmation word; no accidental clicks
+
+## Technical details
+
+- **Platform**: macOS 13 Ventura or later
+- **Architecture**: Apple Silicon (ARM) and Intel (x86_64)
+- **Price**: Free
+- **License**: Open source
+- **Version**: 0.1.0
+- **Author**: Derek Pecka
+
+## Pages
+
+- [Home](https://bubblewrapbackup.com/)
