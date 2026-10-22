@@ -114,6 +114,8 @@ export type BackupResult = {
   manifestPath: string;
   exportPath: string;
   format: string;
+  /** Whether attachment files were copied (not just referenced). */
+  includesAttachments: boolean;
 };
 
 export type ProgressPayload = {
@@ -142,12 +144,15 @@ export type DeleteScope = 'both' | 'messages_only' | 'attachments_only';
 export type RunDeleteArgs = {
   filter: FilterSpec;
   confirmationPhrase: string;
-  backupVerified?: boolean;
-  /** Required by the backend when backupVerified is false. */
+  /**
+   * Required unless a backup with this exact filter ran this session (and,
+   * when attachment files are deleted, copied attachments). The backend
+   * checks its own record of completed backups.
+   */
   acknowledgeSkipBackup?: boolean;
   snapshotRoot?: string;
   deleteScope?: DeleteScope;
-  /** Must be true when Messages in iCloud is enabled. Required by the backend. */
+  /** Must be true unless Messages in iCloud is detected as disabled. */
   acknowledgeIcloudSync?: boolean;
 };
 
@@ -161,6 +166,7 @@ export type DeleteResult = {
   snapshotPath: string;
   onDiskFilesRemoved: number;
   onDiskFilesFailed: number;
+  onDiskFilesSkipped: number;
   backupVerified: boolean;
 };
 
@@ -169,6 +175,8 @@ export type OrphanScan = {
   dbOrphanBytes: number;
   fsOrphanCount: number;
   fsOrphanBytes: number;
+  /** Pass back to cleanOrphans; it refuses if the orphans changed since. */
+  fingerprint: string;
 };
 
 export type OrphanCleanResult = {
@@ -177,6 +185,8 @@ export type OrphanCleanResult = {
   dbFilesFailed: number;
   fsFilesRemoved: number;
   fsFilesFailed: number;
+  filesSkipped: number;
+  snapshotPath: string | null;
 };
 
 
@@ -193,5 +203,6 @@ export const api = {
   previewDelete: (filter: FilterSpec) => invoke<DeletePreview>('preview_delete', { filter }),
   runDelete: (args: RunDeleteArgs) => invoke<DeleteResult>('run_delete', { args }),
   scanOrphans: () => invoke<OrphanScan>('scan_orphans'),
-  cleanOrphans: () => invoke<OrphanCleanResult>('clean_orphans'),
+  cleanOrphans: (scanFingerprint: string) =>
+    invoke<OrphanCleanResult>('clean_orphans', { args: { scanFingerprint } }),
 };

@@ -14,7 +14,10 @@ pub struct SafetyStatus {
 /// a delete operation to proceed. Never performs any mutation.
 #[tauri::command]
 pub async fn safety_status() -> Result<SafetyStatus, AppError> {
-    let messages_running = is_messages_running().unwrap_or(false);
+    // Same conservative default as `run_delete`: if we can't tell, report
+    // "running" so the UI doesn't show a delete as safe that the backend
+    // will then refuse.
+    let messages_running = is_messages_running().unwrap_or(true);
     let icloud_messages = detect_icloud_messages().unwrap_or(ICloudState::Unknown);
     Ok(SafetyStatus {
         messages_running,

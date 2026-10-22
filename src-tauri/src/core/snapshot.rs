@@ -32,8 +32,7 @@ pub fn snapshot_chat_db(chat_db: &Path, snapshot_root: &Path) -> Result<Snapshot
     }
 
     let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let dir = snapshot_root.join(timestamp);
-    fs::create_dir_all(&dir)?;
+    let dir = create_unique_dir(snapshot_root, &timestamp)?;
 
     let db_dest = dir.join("chat.db");
 
@@ -70,6 +69,26 @@ pub fn snapshot_chat_db(chat_db: &Path, snapshot_root: &Path) -> Result<Snapshot
         dir,
         copied: vec![db_dest],
     })
+}
+
+/// Create a fresh `root/<base>` directory, appending `-1`, `-2`, … if it
+/// already exists. Two snapshots in the same second must never share a
+/// folder, or the second would overwrite the only pre-delete copy taken by
+/// the first.
+fn create_unique_dir(root: &Path, base: &str) -> Result<PathBuf, AppError> {
+    fs::create_dir_all(root)?;
+    let mut dir = root.join(base);
+    let mut n = 1u32;
+    loop {
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                dir = root.join(format!("{base}-{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Run `PRAGMA wal_checkpoint(TRUNCATE)` against `chat_db`. Retained as a
@@ -147,6 +166,27 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "snapshot should preserve the pre-delete state");
+    }
+
+    #[test]
+    fn back_to_back_snapshots_do_not_overwrite_each_other() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("chat.db");
+        make_fixture_db(&src);
+        let root = tmp.path().join("snaps");
+
+        let first = snapshot_chat_db(&src, &root).unwrap();
+        let w = Connection::open(&src).unwrap();
+        w.execute("DELETE FROM message", []).unwrap();
+        drop(w);
+        let second = snapshot_chat_db(&src, &root).unwrap();
+
+        assert_ne!(first.dir, second.dir);
+        let conn = Connection::open(first.dir.join("chat.db")).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "first snapshot must survive a second one");
     }
 
     #[test]
