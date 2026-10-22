@@ -104,12 +104,62 @@ pub fn checkpoint_wal(chat_db: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Default snapshot root under the user's home directory:
-/// `~/Documents/iMessage Backups/snapshots`.
-pub fn default_snapshot_root() -> Result<PathBuf, AppError> {
-    let home = std::env::var("HOME")
-        .map_err(|_| AppError::Other("HOME environment variable is not set".into()))?;
-    Ok(PathBuf::from(home).join("Documents/iMessage Backups/snapshots"))
+/// Default snapshot root: `<app data dir>/snapshots`, i.e.
+/// `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots`.
+/// Deliberately not under `~/Documents`, which "Desktop & Documents in
+/// iCloud" uploads to iCloud Drive and may evict from local disk.
+pub fn default_snapshot_root(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Other(format!("cannot locate app data directory: {e}")))?;
+    Ok(dir.join("snapshots"))
+}
+
+/// How many snapshots [`prune_snapshots`] keeps in the default root.
+pub const SNAPSHOTS_TO_KEEP: usize = 5;
+
+/// Remove all but the `keep` newest snapshot folders under `root`. Only
+/// folders this module created (timestamp-named, containing `chat.db`) are
+/// considered. Returns how many were removed; failures are logged and
+/// skipped since pruning is housekeeping, not part of the safety contract.
+pub fn prune_snapshots(root: &Path, keep: usize) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_snapshot_name)
+                && p.join("chat.db").is_file()
+        })
+        .collect();
+    // Names are `YYYY-MM-DDTHH-MM-SS` with an optional `-N` suffix, so a
+    // lexicographic sort is chronological.
+    dirs.sort();
+    let excess = dirs.len().saturating_sub(keep);
+    let mut removed = 0;
+    for dir in dirs.into_iter().take(excess) {
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!("snapshot: failed to prune {}: {e}", dir.display()),
+        }
+    }
+    removed
+}
+
+fn is_snapshot_name(name: &str) -> bool {
+    let (base, suffix) = name.split_at(name.len().min(19));
+    chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H-%M-%S").is_ok()
+        && (suffix.is_empty()
+            || suffix
+                .strip_prefix('-')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
 #[cfg(test)]
@@ -187,6 +237,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "first snapshot must survive a second one");
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_ignores_foreign_folders() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let names = [
+            "2024-01-01T10-00-00",
+            "2024-01-01T10-00-00-1",
+            "2024-01-02T09-00-00",
+            "2025-06-01T00-00-00",
+        ];
+        for n in names {
+            fs::create_dir_all(root.join(n)).unwrap();
+            fs::write(root.join(n).join("chat.db"), b"x").unwrap();
+        }
+        // Not ours: wrong name, or no chat.db.
+        fs::create_dir_all(root.join("my-notes")).unwrap();
+        fs::write(root.join("my-notes/chat.db"), b"x").unwrap();
+        fs::create_dir_all(root.join("2020-01-01T00-00-00")).unwrap();
+
+        assert_eq!(prune_snapshots(root, 2), 2);
+        assert!(!root.join("2024-01-01T10-00-00").exists());
+        assert!(!root.join("2024-01-01T10-00-00-1").exists());
+        assert!(root.join("2024-01-02T09-00-00").exists());
+        assert!(root.join("2025-06-01T00-00-00").exists());
+        assert!(root.join("my-notes").exists());
+        assert!(root.join("2020-01-01T00-00-00").exists());
     }
 
     #[test]

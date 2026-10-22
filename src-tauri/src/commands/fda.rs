@@ -21,8 +21,20 @@ pub async fn check_fda() -> Result<FdaStatus, AppError> {
     let path = default_chat_db_path()?;
     let path_str = path.display().to_string();
 
-    if !path.exists() {
-        return Err(AppError::Other(format!("chat.db not found at {path_str}")));
+    // Don't use `path.exists()`: without FDA, TCC refuses even to stat files
+    // in ~/Library/Messages, and `exists()` reports that as "not found".
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(FdaStatus {
+                granted: false,
+                path: path_str,
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::Other(format!("chat.db not found at {path_str}")));
+        }
+        Err(e) => return Err(AppError::from(e)),
     }
 
     match File::open(&path) {

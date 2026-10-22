@@ -5,17 +5,24 @@ use imessage_database::tables::{
         delete::{execute_delete, preview_delete as lib_preview_delete, DeletePlan},
     },
 };
+use std::collections::{HashMap, HashSet};
+
+use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::core::attachment_files::{attachment_roots, remove_attachment_file, RemoveOutcome};
+use crate::core::attachment_files::{
+    attachment_roots, expand_tilde, path_key, remove_attachment_file, RemoveOutcome,
+};
 use crate::core::db_path::default_chat_db_path;
 use crate::core::filter::FilterSpec;
 use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::core::receipts::BackupReceipts;
 use crate::core::retained::RetainedAttachments;
-use crate::core::snapshot::{checkpoint_wal, default_snapshot_root, snapshot_chat_db};
+use crate::core::snapshot::{
+    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SNAPSHOTS_TO_KEEP,
+};
 use crate::error::AppError;
 
 pub const DELETE_CONFIRMATION_PHRASE: &str = "DELETE";
@@ -39,6 +46,69 @@ pub(crate) fn apply_scope(plan: &mut DeletePlan, scope: &DeleteScope) {
     }
 }
 
+/// Drop attachments from `plan` that a message outside the plan still links
+/// to, and drop on-disk files that an attachment row outside the plan still
+/// points at. The library plans every attachment joined to a matched
+/// message; without this, deleting one message could take an attachment (or
+/// its file) out from under a message the user kept.
+///
+/// Must run before [`apply_scope`], against the full matched message set.
+pub(crate) fn exclude_shared_attachments(
+    conn: &Connection,
+    plan: &mut DeletePlan,
+) -> Result<(), AppError> {
+    if plan.attachment_rowids.is_empty() {
+        return Ok(());
+    }
+    let planned_messages: HashSet<i64> = plan.message_rowids.iter().copied().collect();
+
+    let mut shared: HashSet<i64> = HashSet::new();
+    for chunk in plan.attachment_rowids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT attachment_id, message_id FROM message_attachment_join \
+             WHERE attachment_id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (attachment_id, message_id) = row?;
+            if !planned_messages.contains(&message_id) {
+                shared.insert(attachment_id);
+            }
+        }
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT ROWID, filename, COALESCE(total_bytes, 0) FROM attachment")?;
+    let rows: Vec<(i64, Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+
+    plan.attachment_rowids.retain(|id| !shared.contains(id));
+    let deleting: HashSet<i64> = plan.attachment_rowids.iter().copied().collect();
+
+    let mut bytes_by_row: HashMap<i64, i64> = HashMap::new();
+    let mut kept_files: HashSet<String> = HashSet::new();
+    for (rowid, filename, bytes) in rows {
+        bytes_by_row.insert(rowid, bytes);
+        if !deleting.contains(&rowid) {
+            if let Some(f) = filename {
+                kept_files.insert(path_key(&expand_tilde(&f)));
+            }
+        }
+    }
+
+    for id in &shared {
+        let bytes = bytes_by_row.get(id).copied().unwrap_or(0).max(0) as u64;
+        plan.attachment_bytes = plan.attachment_bytes.saturating_sub(bytes);
+    }
+    plan.attachment_files_on_disk
+        .retain(|p| !kept_files.contains(&path_key(p)));
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeletePreview {
@@ -55,8 +125,9 @@ pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppErro
     let conn = get_connection(&db_path)?;
     let ctx = filter.to_query_context()?;
 
-    let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path)
+    let mut plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path)
         .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    exclude_shared_attachments(&conn, &mut plan)?;
 
     Ok(DeletePreview {
         message_count: plan.message_rowids.len() as u64,
@@ -103,6 +174,32 @@ pub struct RunDeleteArgs {
     /// consequences.
     #[serde(default)]
     pub acknowledge_icloud_sync: bool,
+    /// Messages the user was shown and confirmed (0 when the scope keeps
+    /// messages). When set, the delete refuses if the plan differs — e.g.
+    /// the filter changed after the preview was computed.
+    pub expected_message_count: Option<u64>,
+    /// Attachments the user was shown and confirmed (0 when the scope keeps
+    /// attachments). Checked like `expected_message_count`.
+    pub expected_attachment_count: Option<u64>,
+}
+
+/// Refuse when the scoped plan doesn't match what the user confirmed.
+pub(crate) fn check_expected_counts(
+    plan: &DeletePlan,
+    expected_messages: Option<u64>,
+    expected_attachments: Option<u64>,
+) -> Result<(), AppError> {
+    let messages = plan.message_rowids.len() as u64;
+    let attachments = plan.attachment_rowids.len() as u64;
+    let mismatch = expected_messages.is_some_and(|n| n != messages)
+        || expected_attachments.is_some_and(|n| n != attachments);
+    if mismatch {
+        return Err(AppError::Other(format!(
+            "What would be deleted changed since the preview (now {messages} messages and \
+             {attachments} attachments). Nothing was deleted — review the preview and try again."
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -214,15 +311,6 @@ pub async fn run_delete(
 
     let db_path = default_chat_db_path()?;
 
-    // Gate 3: mandatory WAL checkpoint + snapshot.
-    let snapshot_root = match args.snapshot_root.as_deref() {
-        Some(p) if !p.is_empty() => crate::core::paths::validate_user_path(p, "snapshot root")?,
-        _ => default_snapshot_root()?,
-    };
-
-    checkpoint_wal(&db_path)?;
-    let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
-
     // Build the delete plan against a read-only connection — even though
     // we'll execute it against a writable one, there's no reason to hold
     // two writers, and the read-only path is more conservative.
@@ -230,26 +318,61 @@ pub async fn run_delete(
     let ctx = args.filter.to_query_context()?;
     let mut plan = lib_preview_delete(&read_conn, &ctx, &AttachmentFilter::any(), &db_path)
         .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    exclude_shared_attachments(&read_conn, &mut plan)?;
     drop(read_conn);
 
     // A messages-only delete also drops the message_attachment_join rows,
-    // leaving the kept attachments unlinked. Record them before touching
-    // the DB so the orphan cleaner never removes what the user kept.
-    if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
-        RetainedAttachments::for_app(&app)?.add(&plan.attachment_rowids)?;
-    }
+    // leaving the kept attachments unlinked; the orphan cleaner must skip
+    // them.
+    let keep_attachments = if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
+        plan.attachment_rowids.clone()
+    } else {
+        Vec::new()
+    };
 
     apply_scope(&mut plan, &args.delete_scope);
+
+    // Gate 3: the plan must match what the user confirmed.
+    check_expected_counts(
+        &plan,
+        args.expected_message_count,
+        args.expected_attachment_count,
+    )?;
+
+    // Gate 4: mandatory WAL checkpoint + snapshot.
+    let (snapshot_root, managed_root) = match args.snapshot_root.as_deref() {
+        Some(p) if !p.is_empty() => (
+            crate::core::paths::validate_user_path(p, "snapshot root")?,
+            false,
+        ),
+        _ => (default_snapshot_root(&app)?, true),
+    };
+
+    checkpoint_wal(&db_path)?;
+    let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
+    if managed_root {
+        // Only ever prune the folder we own; a caller-chosen root is theirs.
+        prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
+    }
 
     // Re-check right before writing: the snapshot of a large chat.db can
     // take long enough for the user to reopen Messages.
     ensure_messages_not_running()?;
+
+    // Record kept attachments before the transaction (so a crash after
+    // commit can't leave them unprotected) and roll the record back if the
+    // transaction fails.
+    let retained = RetainedAttachments::for_app(&app)?;
+    let newly_retained = retained.add(&keep_attachments)?;
 
     // Now execute against a writable connection.
     let mut write_conn = get_writable_connection(&db_path)?;
     let report = match execute_delete(&mut write_conn, &plan) {
         Ok(r) => r,
         Err(e) => {
+            if let Err(re) = retained.remove(&newly_retained) {
+                eprintln!("delete: failed to roll back retained attachment list: {re:?}");
+            }
             return Err(AppError::Database(format!(
                 "delete transaction failed (rolled back; no changes made): {e}"
             )));
@@ -470,6 +593,63 @@ mod tests {
             ..Default::default()
         };
         assert!(check_backup_gate(&receipts, &other, &DeleteScope::Both, false).is_err());
+    }
+
+    #[test]
+    fn shared_attachments_and_files_are_excluded_from_plan() {
+        let (tmp, db_path, att1) = fresh_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        // Message 3 lives in another chat and is NOT being deleted.
+        let shared_file = tmp.path().join("shared.jpg");
+        std::fs::write(&shared_file, b"x").unwrap();
+        conn.execute_batch(
+            "INSERT INTO chat (ROWID, chat_identifier) VALUES (2, 'other');
+             INSERT INTO message (ROWID, guid, handle_id, date) VALUES (3, 'g3', 1, 0);
+             INSERT INTO chat_message_join VALUES (2, 3);
+             -- Attachment 2 is linked from a deleted message and a kept one.
+             INSERT INTO attachment (ROWID, filename, total_bytes) VALUES (2, '/nowhere/a2', 100);
+             INSERT INTO message_attachment_join VALUES (1, 2), (3, 2);",
+        )
+        .unwrap();
+        // Attachments 3 (deleted message) and 4 (kept message) share a file.
+        conn.execute(
+            "INSERT INTO attachment (ROWID, filename, total_bytes) VALUES (3, ?1, 7), (4, ?1, 7)",
+            params![shared_file.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO message_attachment_join VALUES (1, 3), (3, 4);")
+            .unwrap();
+
+        let mut ctx = QueryContext::default();
+        ctx.set_selected_chat_ids(std::collections::BTreeSet::from([1]));
+        let mut plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
+        let mut planned = plan.attachment_rowids.clone();
+        planned.sort();
+        assert_eq!(planned, vec![1, 2, 3]);
+
+        exclude_shared_attachments(&conn, &mut plan).unwrap();
+        let mut kept = plan.attachment_rowids.clone();
+        kept.sort();
+        // Attachment 2 is still linked to message 3, so it stays.
+        assert_eq!(kept, vec![1, 3]);
+        assert_eq!(plan.attachment_bytes, 15 + 7);
+        // Row 3 goes, but its file is still used by row 4.
+        assert!(plan.attachment_files_on_disk.contains(&att1));
+        assert!(!plan.attachment_files_on_disk.contains(&shared_file));
+    }
+
+    #[test]
+    fn expected_counts_must_match_scoped_plan() {
+        let plan = DeletePlan {
+            message_rowids: vec![1, 2],
+            attachment_rowids: vec![10],
+            ..Default::default()
+        };
+        assert!(check_expected_counts(&plan, None, None).is_ok());
+        assert!(check_expected_counts(&plan, Some(2), Some(1)).is_ok());
+        let err = check_expected_counts(&plan, Some(3), Some(1)).unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("changed since the preview")));
+        assert!(check_expected_counts(&plan, Some(2), Some(0)).is_err());
     }
 
     #[test]

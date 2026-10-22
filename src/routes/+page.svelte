@@ -69,12 +69,14 @@
 
     if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
       const [y, m, d] = trimmed.split('-').map(Number);
-      const date = new Date(trimmed + 'T00:00:00');
+      // Build and check in the same (local) calendar: mixing local
+      // construction with UTC getters rejects every date east of UTC.
+      const date = new Date(y, m - 1, d);
       if (
         isNaN(date.getTime()) ||
-        date.getUTCFullYear() !== y ||
-        date.getUTCMonth() + 1 !== m ||
-        date.getUTCDate() !== d
+        date.getFullYear() !== y ||
+        date.getMonth() + 1 !== m ||
+        date.getDate() !== d
       ) {
         return { resolved: '', error: 'Invalid date' };
       }
@@ -94,6 +96,13 @@
       endDateParsed.resolved < startDateParsed.resolved
       ? 'End date must be after start date'
       : ''
+  );
+
+  // Any date problem blocks preview, backup and delete outright. Never fall
+  // back to "no date filter": that silently widens the scope to every
+  // message in the database.
+  let dateFilterError = $derived(
+    startDateParsed.error || endDateParsed.error || endDateOrderError
   );
 
   // preview state
@@ -119,6 +128,9 @@
   let orphanScan = $state<OrphanScan | null>(null);
   let orphanResult = $state<OrphanCleanResult | null>(null);
   let orphanError = $state('');
+  // Whether the current scan includes attachments kept by earlier
+  // messages-only deletes.
+  let orphanIncludeRetained = $state(false);
   let unlistenMenuClean: UnlistenFn | null = null;
   let orphanModalCard = $state<HTMLDivElement | null>(null);
 
@@ -177,6 +189,9 @@
   let deletePreview = $state<DeletePreview | null>(null);
   let deletePreviewing = $state(false);
   let deletePreviewSeq = 0;
+  // Filter the current `deletePreview` was computed for. A preview only
+  // counts as current when this matches the live filter.
+  let deletePreviewFilterKey = $state('');
   let deletePreviewTimer: ReturnType<typeof setTimeout> | undefined;
   let deleteMessages = $state(true);
   let deleteAttachments = $state(true);
@@ -206,7 +221,7 @@
     }).then((fn) => {
       unlistenProgress = fn;
     });
-    listen('menu:clean-orphans', startOrphanScan).then((fn) => {
+    listen('menu:clean-orphans', () => startOrphanScan(false)).then((fn) => {
       unlistenMenuClean = fn;
     });
   });
@@ -360,7 +375,7 @@
     void selectedChatIds;
 
     if (status !== 'ok') return;
-    if (startDateParsed.error || endDateParsed.error || endDateOrderError) return;
+    if (dateFilterError) return;
 
     clearTimeout(previewTimer);
     previewTimer = setTimeout(runPreview, 400);
@@ -396,6 +411,10 @@
     progress = null;
     if (!destination) {
       runError = 'Pick a destination folder first.';
+      return;
+    }
+    if (dateFilterError) {
+      runError = `Fix the date filter first: ${dateFilterError}.`;
       return;
     }
     running = true;
@@ -444,13 +463,18 @@
     const seq = ++deletePreviewSeq;
     deletePreviewing = true;
     deleteError = '';
+    const filter = buildFilter();
     try {
-      const result = await api.previewDelete(buildFilter());
-      if (seq === deletePreviewSeq) deletePreview = result;
+      const result = await api.previewDelete(filter);
+      if (seq === deletePreviewSeq) {
+        deletePreview = result;
+        deletePreviewFilterKey = JSON.stringify(filter);
+      }
     } catch (err) {
       if (seq === deletePreviewSeq) {
         deleteError = appErrorMessage(err);
         deletePreview = null;
+        deletePreviewFilterKey = '';
       }
     } finally {
       if (seq === deletePreviewSeq) deletePreviewing = false;
@@ -465,6 +489,13 @@
     void deleteExpanded;
 
     if (status !== 'ok' || !deleteExpanded) return;
+    if (dateFilterError) {
+      // Don't show (or keep) counts for a filter we can't apply.
+      clearTimeout(deletePreviewTimer);
+      deletePreview = null;
+      deletePreviewFilterKey = '';
+      return;
+    }
 
     clearTimeout(deletePreviewTimer);
     deletePreviewTimer = setTimeout(runDeletePreview, 400);
@@ -472,7 +503,10 @@
   });
 
   async function runDelete() {
-    if (!deletePreview) return;
+    if (!deletePreview || !deletePreviewCurrent || dateFilterError) return;
+    const filter = buildFilter();
+    const expectedMessageCount = deleteMessages ? deletePreview.messageCount : 0;
+    const expectedAttachmentCount = deleteAttachments ? deletePreview.attachmentCount : 0;
 
     const parts: string[] = [];
     if (deleteMessages && deletePreview.messageCount > 0)
@@ -507,7 +541,11 @@
         return;
       }
       deleteResult = await api.runDelete({
-        filter: buildFilter(),
+        filter,
+        // The backend refuses if what it would delete differs from what the
+        // dialog above showed.
+        expectedMessageCount,
+        expectedAttachmentCount,
         confirmationPhrase: 'DELETE',
         // The backend checks its own record of completed backups; only the
         // explicit opt-out is ours to send.
@@ -533,13 +571,14 @@
         : 'attachments_only'
   );
 
-  async function startOrphanScan() {
+  async function startOrphanScan(includeRetained = false) {
+    orphanIncludeRetained = includeRetained;
     orphanModal = 'scanning';
     orphanScan = null;
     orphanResult = null;
     orphanError = '';
     try {
-      orphanScan = await api.scanOrphans();
+      orphanScan = await api.scanOrphans(includeRetained);
       orphanModal = 'preview';
     } catch (err) {
       orphanError = appErrorMessage(err);
@@ -552,7 +591,7 @@
     orphanModal = 'cleaning';
     orphanError = '';
     try {
-      orphanResult = await api.cleanOrphans(orphanScan.fingerprint);
+      orphanResult = await api.cleanOrphans(orphanScan.fingerprint, orphanIncludeRetained);
       orphanModal = 'done';
     } catch (err) {
       orphanError = appErrorMessage(err);
@@ -573,8 +612,16 @@
     runResult !== null && (!deleteAttachments || runResult.includesAttachments)
   );
 
+  const deletePreviewCurrent = $derived(
+    deletePreview !== null &&
+      !deletePreviewing &&
+      deletePreviewFilterKey === JSON.stringify(buildFilter())
+  );
+
   const deleteReady = $derived(
     deletePreview !== null &&
+      deletePreviewCurrent &&
+      !dateFilterError &&
       (deleteMessages || deleteAttachments) &&
       ((deleteMessages && deletePreview.messageCount > 0) ||
         (deleteAttachments && deletePreview.attachmentCount > 0)) &&
@@ -878,7 +925,11 @@
     </label>
 
     <div class="actions">
-      <button class="primary" onclick={runBackup} disabled={running || !destination}>
+      <button
+        class="primary"
+        onclick={runBackup}
+        disabled={running || !destination || !!dateFilterError}
+      >
         {running ? 'Running…' : 'Run backup'}
       </button>
     </div>
@@ -996,7 +1047,9 @@
         </label>
       </div>
 
-      {#if deletePreviewing}
+      {#if dateFilterError}
+        <p class="err">Fix the date filter above before deleting: {dateFilterError}.</p>
+      {:else if deletePreviewing}
         <p class="meta preview-counting">Counting…</p>
       {:else if deletePreview}
         {#if deleteMessages && deleteAttachments}
@@ -1117,6 +1170,17 @@
             <span class="orphan-size">{formatBytes(orphanScan.fsOrphanBytes)}</span>
           </div>
         </div>
+        {#if orphanScan.retainedCount > 0 || orphanIncludeRetained}
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={orphanIncludeRetained}
+              onchange={(e) => startOrphanScan(e.currentTarget.checked)}
+            />
+            Also remove attachments kept by earlier "messages only" deletes{#if !orphanIncludeRetained}
+              ({orphanScan.retainedCount.toLocaleString()}, {formatBytes(orphanScan.retainedBytes)}){/if}
+          </label>
+        {/if}
         <p class="meta">
           Quit Messages before cleaning. Folders that still hold a referenced attachment and files
           changed in the last 24 hours are left alone, and chat.db is snapshotted before any records

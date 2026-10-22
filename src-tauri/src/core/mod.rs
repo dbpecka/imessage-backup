@@ -1,5 +1,7 @@
 pub mod attachment_files;
-#[cfg(target_os = "macos")]
+// Reading AddressBook only happens on macOS, but the matching logic is
+// platform-independent so it can be unit-tested anywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod contacts;
 pub mod db_path;
 pub mod filter;
