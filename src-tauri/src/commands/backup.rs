@@ -12,11 +12,12 @@ use imessage_database::{
     tables::{messages::message::Message, table::get_connection},
 };
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 
 use crate::core::db_path::default_chat_db_path;
 use crate::core::filter::FilterSpec;
 use crate::core::progress::TauriProgress;
+use crate::core::receipts::BackupReceipts;
 use crate::error::AppError;
 
 pub const BACKUP_PROGRESS_EVENT: &str = "backup-progress";
@@ -41,17 +42,26 @@ pub struct BackupResult {
     pub manifest_path: String,
     pub export_path: String,
     pub format: String,
+    /// Whether attachment files were copied into the export. A backup that
+    /// only references attachments doesn't protect them from a delete.
+    pub includes_attachments: bool,
 }
 
 /// Run a backup with the supplied filter and format to the supplied
 /// destination directory. Emits progress events on `backup-progress`.
 #[tauri::command]
-pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupResult, AppError> {
+pub async fn run_backup(
+    app: AppHandle,
+    receipts: State<'_, BackupReceipts>,
+    args: RunBackupArgs,
+) -> Result<BackupResult, AppError> {
     let format = ExportType::from_cli(&args.format)
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
 
     let db_path = default_chat_db_path()?;
     let destination = crate::core::paths::validate_user_path(&args.destination, "destination")?;
+    let filter_key = args.filter.key();
+    let includes_attachments = args.copy_attachments;
 
     let config = ExportConfig {
         db_path,
@@ -83,6 +93,7 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     manifest_path: summary.manifest_path.display().to_string(),
                     export_path: config.export_path.display().to_string(),
                     format: format_label,
+                    includes_attachments,
                 })
             }
             ExportType::Pdf => {
@@ -102,6 +113,7 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     manifest_path: String::new(),
                     export_path: config.export_path.display().to_string(),
                     format: format_label,
+                    includes_attachments,
                 })
             }
             ExportType::Html | ExportType::Txt => {
@@ -159,12 +171,17 @@ pub async fn run_backup(app: AppHandle, args: RunBackupArgs) -> Result<BackupRes
                     manifest_path: String::new(),
                     export_path: export_path.display().to_string(),
                     format: format_label,
+                    includes_attachments,
                 })
             }
         }
     })
     .await
     .map_err(|e| AppError::Other(format!("task join error: {e}")))??;
+
+    // Only a backup that ran to completion counts toward `run_delete`'s
+    // backup gate.
+    receipts.record(filter_key, includes_attachments);
 
     Ok(result)
 }

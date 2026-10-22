@@ -1,3 +1,4 @@
+pub mod attachment_files;
 #[cfg(target_os = "macos")]
 pub mod contacts;
 pub mod db_path;
@@ -6,4 +7,6 @@ pub mod icloud;
 pub mod messages_app;
 pub mod paths;
 pub mod progress;
+pub mod receipts;
+pub mod retained;
 pub mod snapshot;

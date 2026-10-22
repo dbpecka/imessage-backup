@@ -509,12 +509,13 @@
       deleteResult = await api.runDelete({
         filter: buildFilter(),
         confirmationPhrase: 'DELETE',
-        backupVerified: runResult !== null,
-        acknowledgeSkipBackup: runResult !== null || skipBackupAcknowledged,
+        // The backend checks its own record of completed backups; only the
+        // explicit opt-out is ours to send.
+        acknowledgeSkipBackup: skipBackupAcknowledged,
         deleteScope,
-        // Surface the iCloud risk to the backend so it can refuse if detection
-        // flipped to Enabled since the user ticked the acknowledgement box.
-        acknowledgeIcloudSync: safety?.icloudMessages !== 'enabled' || icloudAcknowledged
+        // Only the user's own acknowledgement — never auto-ack, or the
+        // backend gate is bypassed if its detection disagrees with ours.
+        acknowledgeIcloudSync: icloudAcknowledged
       });
       await Promise.all([runPreview(), runDeletePreview(), loadChats()]);
     } catch (err) {
@@ -547,10 +548,11 @@
   }
 
   async function runOrphanClean() {
+    if (!orphanScan) return;
     orphanModal = 'cleaning';
     orphanError = '';
     try {
-      orphanResult = await api.cleanOrphans();
+      orphanResult = await api.cleanOrphans(orphanScan.fingerprint);
       orphanModal = 'done';
     } catch (err) {
       orphanError = appErrorMessage(err);
@@ -565,6 +567,12 @@
     (orphanScan?.dbOrphanBytes ?? 0) + (orphanScan?.fsOrphanBytes ?? 0)
   );
 
+  // A backup only protects attachment files if it copied them: the safety
+  // snapshot taken before a delete covers chat.db, not files on disk.
+  const backupCoversDelete = $derived(
+    runResult !== null && (!deleteAttachments || runResult.includesAttachments)
+  );
+
   const deleteReady = $derived(
     deletePreview !== null &&
       (deleteMessages || deleteAttachments) &&
@@ -572,8 +580,8 @@
         (deleteAttachments && deletePreview.attachmentCount > 0)) &&
       safety !== null &&
       !safety.messagesRunning &&
-      (safety.icloudMessages !== 'enabled' || icloudAcknowledged) &&
-      (runResult !== null || skipBackupAcknowledged) &&
+      (safety.icloudMessages === 'disabled' || icloudAcknowledged) &&
+      (backupCoversDelete || skipBackupAcknowledged) &&
       !deleting
   );
 
@@ -971,6 +979,10 @@
           Couldn't confirm Messages-in-iCloud state. If it's enabled, deletes will replicate to your
           other devices.
         </p>
+        <label class="checkbox">
+          <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
+          I've checked Messages in iCloud myself and want to proceed.
+        </label>
       {/if}
 
       <div>
@@ -1010,10 +1022,15 @@
           <p class="meta">Select at least one option above.</p>
         {/if}
 
-        {#if !runResult}
+        {#if !backupCoversDelete}
           <p class="meta">
-            Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
-            you're about to remove.
+            {#if runResult}
+              Your backup didn't copy attachment files. Deleted attachments can't be restored from
+              the safety snapshot — re-run the backup (Step 4) with attachments copied.
+            {:else}
+              Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
+              you're about to remove.
+            {/if}
           </p>
           <label class="checkbox">
             <input
@@ -1045,6 +1062,8 @@
               {deleteResult.attachmentsDeleted.toLocaleString()} attachments
               ({deleteResult.onDiskFilesRemoved.toLocaleString()} files removed from disk{#if deleteResult.onDiskFilesFailed > 0}
                 , {deleteResult.onDiskFilesFailed.toLocaleString()} failed
+              {/if}{#if deleteResult.onDiskFilesSkipped > 0}
+                , {deleteResult.onDiskFilesSkipped.toLocaleString()} skipped (outside the Messages folders)
               {/if})
             </li>
             <li>
@@ -1098,6 +1117,11 @@
             <span class="orphan-size">{formatBytes(orphanScan.fsOrphanBytes)}</span>
           </div>
         </div>
+        <p class="meta">
+          Quit Messages before cleaning. Folders that still hold a referenced attachment and files
+          changed in the last 24 hours are left alone, and chat.db is snapshotted before any records
+          are removed.
+        </p>
         <p class="orphan-total">
           {#if totalOrphanItems === 0}
             No orphaned data found.
@@ -1134,6 +1158,14 @@
                 {filesRemoved.toLocaleString()} file{filesRemoved === 1 ? '' : 's'} removed from
                 disk{#if filesFailed > 0}, {filesFailed.toLocaleString()} failed{/if}
               </li>
+            {/if}
+            {#if orphanResult.filesSkipped > 0}
+              <li>
+                {orphanResult.filesSkipped.toLocaleString()} skipped (outside the Messages folders)
+              </li>
+            {/if}
+            {#if orphanResult.snapshotPath}
+              <li>Snapshot: <code>{orphanResult.snapshotPath}</code></li>
             {/if}
           </ul>
         </div>

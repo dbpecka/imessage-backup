@@ -1,5 +1,3 @@
-use std::fs;
-
 use imessage_database::tables::{
     table::{get_connection, get_writable_connection},
     write::{
@@ -8,11 +6,15 @@ use imessage_database::tables::{
     },
 };
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, State};
 
+use crate::core::attachment_files::{attachment_roots, remove_attachment_file, RemoveOutcome};
 use crate::core::db_path::default_chat_db_path;
 use crate::core::filter::FilterSpec;
 use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
+use crate::core::receipts::BackupReceipts;
+use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{checkpoint_wal, default_snapshot_root, snapshot_chat_db};
 use crate::error::AppError;
 
@@ -83,15 +85,10 @@ pub enum DeleteScope {
 pub struct RunDeleteArgs {
     pub filter: FilterSpec,
     pub confirmation_phrase: String,
-    /// Set to `true` when the caller has already run a matching `run_backup`
-    /// in this session. If `false`, `acknowledge_skip_backup` must be
-    /// explicitly `true` — the backend no longer silently permits
-    /// backup-less deletes.
-    #[serde(default)]
-    pub backup_verified: bool,
-    /// Required when `backup_verified` is `false`. A direct-IPC caller must
-    /// actively opt out of the backup recommendation rather than default
-    /// into it.
+    /// Required when no backup with exactly this filter ran in this session
+    /// (or, when attachment files will be deleted, when that backup didn't
+    /// copy attachments). Whether a backup ran is checked against the
+    /// backend's own receipts — the frontend can't assert it.
     #[serde(default)]
     pub acknowledge_skip_backup: bool,
     /// Optional override for where snapshots are stored. Defaults to
@@ -100,9 +97,10 @@ pub struct RunDeleteArgs {
     /// Controls which parts of the matched records are removed.
     #[serde(default)]
     pub delete_scope: DeleteScope,
-    /// Must be `true` when Messages in iCloud is detected as enabled. A
-    /// local delete on a synced account can be re-synced from cloud state,
-    /// so the caller has to prove they understand the consequences.
+    /// Must be `true` unless Messages in iCloud is positively detected as
+    /// disabled. A local delete on a synced account can be re-synced from
+    /// cloud state, so the caller has to prove they understand the
+    /// consequences.
     #[serde(default)]
     pub acknowledge_icloud_sync: bool,
 }
@@ -119,16 +117,61 @@ pub struct DeleteResult {
     pub snapshot_path: String,
     pub on_disk_files_removed: u64,
     pub on_disk_files_failed: u64,
+    /// Files left alone because they weren't regular files inside the
+    /// Messages attachment folders.
+    pub on_disk_files_skipped: u64,
     pub backup_verified: bool,
 }
 
+/// Returns whether a matching backup ran, or errors if none did and the
+/// caller didn't explicitly opt out. The snapshot only covers chat.db, so
+/// when attachment files will be unlinked the backup must have copied them.
+pub(crate) fn check_backup_gate(
+    receipts: &BackupReceipts,
+    filter: &FilterSpec,
+    scope: &DeleteScope,
+    acknowledge_skip_backup: bool,
+) -> Result<bool, AppError> {
+    let key = filter.key();
+    let deletes_files = !matches!(scope, DeleteScope::MessagesOnly);
+    let verified = receipts.covers(&key, deletes_files);
+    if verified || acknowledge_skip_backup {
+        return Ok(verified);
+    }
+    let msg = if deletes_files && receipts.covers(&key, false) {
+        "The backup for this filter didn't copy attachment files, and this delete removes \
+         them permanently (the safety snapshot only covers chat.db). Re-run the backup with \
+         attachments, or pass acknowledgeSkipBackup=true to proceed anyway."
+    } else {
+        "No backup has been run for this filter. Run a backup first, or pass \
+         acknowledgeSkipBackup=true to proceed without one."
+    };
+    Err(AppError::Other(msg.into()))
+}
+
+fn ensure_messages_not_running() -> Result<(), AppError> {
+    // We err on the side of refusing when we can't tell (pgrep unavailable
+    // → treat as "could be running").
+    if is_messages_running().unwrap_or(true) {
+        return Err(AppError::Other(
+            "Quit Messages.app before running a delete — it holds a write lock on chat.db.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Execute a delete. Enforces the full safety contract: typed
-/// confirmation, Messages.app-not-running, mandatory snapshot with a WAL
-/// checkpoint, then a transactional delete against a writable connection.
-/// Attachment files on disk are unlinked **after** the SQL transaction
-/// commits; individual unlink failures are counted but do not roll back.
+/// confirmation, backup (or explicit skip), Messages.app-not-running,
+/// iCloud acknowledgement, mandatory snapshot with a WAL checkpoint, then a
+/// transactional delete against a writable connection. Attachment files on
+/// disk are unlinked **after** the SQL transaction commits; individual
+/// unlink failures are counted but do not roll back.
 #[tauri::command]
-pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
+pub async fn run_delete(
+    app: AppHandle,
+    receipts: State<'_, BackupReceipts>,
+    args: RunDeleteArgs,
+) -> Result<DeleteResult, AppError> {
     // Gate 1: typed confirmation.
     if args.confirmation_phrase != DELETE_CONFIRMATION_PHRASE {
         return Err(AppError::Other(format!(
@@ -136,38 +179,37 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
         )));
     }
 
-    // Gate 1a: backup gate. If the caller didn't back up first, they must
-    // explicitly acknowledge the skip. This turns the previously-advisory
-    // flag into a real check that survives a frontend regression or a
-    // direct-IPC caller.
-    if !args.backup_verified && !args.acknowledge_skip_backup {
-        return Err(AppError::Other(
-            "No backup has been run for this filter. Run a backup first, or pass \
-             acknowledgeSkipBackup=true to proceed without one."
-                .into(),
-        ));
-    }
+    // Gate 1a: backup gate.
+    let backup_verified = check_backup_gate(
+        &receipts,
+        &args.filter,
+        &args.delete_scope,
+        args.acknowledge_skip_backup,
+    )?;
 
-    // Gate 2: Messages.app must be quit. We err on the side of refusing
-    // when we can't tell (pgrep unavailable → treat as "could be running").
-    if is_messages_running().unwrap_or(true) {
-        return Err(AppError::Other(
-            "Quit Messages.app before running a delete — it holds a write lock on chat.db.".into(),
-        ));
-    }
+    // Gate 2: Messages.app must be quit.
+    ensure_messages_not_running()?;
 
-    // Gate 2a: Messages-in-iCloud refuses-to-proceed without explicit ack.
-    // When detection is Unknown we don't block (false positives would be
-    // worse than a soft UI warning), but Enabled is hard-gated.
-    if detect_icloud_messages().unwrap_or(ICloudState::Unknown) == ICloudState::Enabled
-        && !args.acknowledge_icloud_sync
-    {
-        return Err(AppError::Other(
-            "Messages in iCloud is enabled. A local delete may be re-synced from cloud. \
-             Acknowledge the iCloud warning in the UI (or pass acknowledgeIcloudSync=true) \
-             before retrying."
-                .into(),
-        ));
+    // Gate 2a: Messages in iCloud. Detection is best-effort, so anything
+    // other than a positive "disabled" needs an explicit acknowledgement.
+    match detect_icloud_messages().unwrap_or(ICloudState::Unknown) {
+        ICloudState::Disabled => {}
+        ICloudState::Enabled if !args.acknowledge_icloud_sync => {
+            return Err(AppError::Other(
+                "Messages in iCloud is enabled. A local delete may be re-synced from cloud. \
+                 Acknowledge the iCloud warning in the UI (or pass acknowledgeIcloudSync=true) \
+                 before retrying."
+                    .into(),
+            ));
+        }
+        ICloudState::Unknown if !args.acknowledge_icloud_sync => {
+            return Err(AppError::Other(
+                "Couldn't determine whether Messages in iCloud is enabled. Acknowledge the \
+                 iCloud warning in the UI (or pass acknowledgeIcloudSync=true) before retrying."
+                    .into(),
+            ));
+        }
+        _ => {}
     }
 
     let db_path = default_chat_db_path()?;
@@ -190,7 +232,18 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
         .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
     drop(read_conn);
 
+    // A messages-only delete also drops the message_attachment_join rows,
+    // leaving the kept attachments unlinked. Record them before touching
+    // the DB so the orphan cleaner never removes what the user kept.
+    if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
+        RetainedAttachments::for_app(&app)?.add(&plan.attachment_rowids)?;
+    }
+
     apply_scope(&mut plan, &args.delete_scope);
+
+    // Re-check right before writing: the snapshot of a large chat.db can
+    // take long enough for the user to reopen Messages.
+    ensure_messages_not_running()?;
 
     // Now execute against a writable connection.
     let mut write_conn = get_writable_connection(&db_path)?;
@@ -207,22 +260,18 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
 
     // Unlink attachment files from disk. Failures are non-fatal — the DB is
     // the source of truth, so a stale file on disk is a minor janitor issue,
-    // not a data-integrity event. Still, we emit the path + reason to stderr
-    // so the user has something to grep after the fact.
+    // not a data-integrity event. Paths come from chat.db, so only regular
+    // files inside the Messages attachment folders are ever removed.
+    let roots = attachment_roots();
     let mut removed = 0u64;
     let mut failed = 0u64;
+    let mut skipped = 0u64;
     for p in &plan.attachment_files_on_disk {
-        if p.exists() {
-            match fs::remove_file(p) {
-                Ok(()) => removed += 1,
-                Err(e) => {
-                    eprintln!(
-                        "delete: failed to remove attachment file {}: {e}",
-                        p.display()
-                    );
-                    failed += 1;
-                }
-            }
+        match remove_attachment_file(p, &roots, "delete") {
+            RemoveOutcome::Removed => removed += 1,
+            RemoveOutcome::Missing => {}
+            RemoveOutcome::Refused => skipped += 1,
+            RemoveOutcome::Failed => failed += 1,
         }
     }
 
@@ -236,7 +285,8 @@ pub async fn run_delete(args: RunDeleteArgs) -> Result<DeleteResult, AppError> {
         snapshot_path: snapshot.dir.display().to_string(),
         on_disk_files_removed: removed,
         on_disk_files_failed: failed,
-        backup_verified: args.backup_verified,
+        on_disk_files_skipped: skipped,
+        backup_verified,
     })
 }
 
@@ -392,6 +442,34 @@ mod tests {
         assert_eq!(plan.message_rowids, original.message_rowids);
         assert_eq!(plan.attachment_rowids, original.attachment_rowids);
         assert_eq!(plan.attachment_bytes, original.attachment_bytes);
+    }
+
+    #[test]
+    fn backup_gate_requires_matching_backup_with_attachments_when_deleting_files() {
+        let receipts = BackupReceipts::default();
+        let filter = FilterSpec::default();
+        let gate =
+            |scope: DeleteScope, ack: bool| check_backup_gate(&receipts, &filter, &scope, ack);
+
+        assert!(gate(DeleteScope::Both, false).is_err());
+        assert!(!gate(DeleteScope::Both, true).unwrap());
+
+        // A references-only backup covers a messages-only delete…
+        receipts.record(filter.key(), false);
+        assert!(gate(DeleteScope::MessagesOnly, false).unwrap());
+        // …but not one that unlinks attachment files.
+        let err = gate(DeleteScope::AttachmentsOnly, false).unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("didn't copy attachment")));
+
+        receipts.record(filter.key(), true);
+        assert!(gate(DeleteScope::Both, false).unwrap());
+
+        // A backup for a different filter doesn't count.
+        let other = FilterSpec {
+            chat_ids: Some(vec![7]),
+            ..Default::default()
+        };
+        assert!(check_backup_gate(&receipts, &other, &DeleteScope::Both, false).is_err());
     }
 
     #[test]
