@@ -201,6 +201,14 @@ export type DeleteResult = {
   backupVerified: boolean;
 };
 
+/** Whether completed backups (from any session) cover what a filter matches now. */
+export type BackupCoverage = {
+  covered: boolean;
+  /** …and that backup copied every attachment file. */
+  withAttachments: boolean;
+  exportPath: string | null;
+};
+
 export type OrphanScan = {
   dbOrphanCount: number;
   dbOrphanBytes: number;
@@ -236,6 +244,8 @@ export const api = {
   safetyStatus: () => invoke<SafetyStatus>('safety_status'),
   previewDelete: (filter: FilterSpec) => invoke<DeletePreview>('preview_delete', { filter }),
   runDelete: (args: RunDeleteArgs) => invoke<DeleteResult>('run_delete', { args }),
+  backupCoverage: (filter: FilterSpec) =>
+    invoke<BackupCoverage>('backup_coverage', { filter }),
   scanOrphans: (includeRetained = false) =>
     invoke<OrphanScan>('scan_orphans', { includeRetained }),
   cleanOrphans: (scanFingerprint: string, includeRetained = false) =>

@@ -19,7 +19,7 @@ use crate::core::filter::FilterSpec;
 use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::core::op_lock::OperationLock;
-use crate::core::receipts::BackupReceipts;
+use crate::core::receipts::{BackupReceipts, ContentFingerprint, Coverage};
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
     checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
@@ -260,18 +260,42 @@ pub(crate) fn count_not_on_mac(conn: &Connection, plan: &DeletePlan) -> Result<u
 
 /// The full (unscoped) plan for `ctx`, shared by the preview and the delete
 /// so the counts the user confirms are the counts that get deleted.
-/// Also returns how many tapbacks outside the filter were added because
-/// their target message is being deleted.
+pub(crate) struct BuiltPlan {
+    pub plan: DeletePlan,
+    /// Tapbacks outside the filter added because their target message is
+    /// being deleted.
+    pub reactions: u64,
+    /// What the filter itself matches (before tapbacks are added or shared
+    /// attachments removed) — the same thing a backup of this filter
+    /// records, so the two can be compared.
+    pub content: ContentFingerprint,
+}
+
+/// What `ctx` matches, as recorded by a backup and checked by a delete.
+pub(crate) fn filter_content(
+    conn: &Connection,
+    ctx: &QueryContext,
+    db_path: &std::path::Path,
+) -> Result<(DeletePlan, ContentFingerprint), AppError> {
+    let plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
+        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    let content = ContentFingerprint::of(&plan.message_rowids, &plan.attachment_rowids);
+    Ok((plan, content))
+}
+
 pub(crate) fn build_plan(
     conn: &Connection,
     ctx: &QueryContext,
     db_path: &std::path::Path,
-) -> Result<(DeletePlan, u64), AppError> {
-    let mut plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
-        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+) -> Result<BuiltPlan, AppError> {
+    let (mut plan, content) = filter_content(conn, ctx, db_path)?;
     let reactions = add_orphaned_reactions(conn, &mut plan)?;
     exclude_shared_attachments(conn, &mut plan)?;
-    Ok((plan, reactions))
+    Ok(BuiltPlan {
+        plan,
+        reactions,
+        content,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -295,7 +319,11 @@ pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppErro
     let ctx = filter.to_query_context()?;
     blocking(move || {
         let conn = open_read(&db_path)?;
-        let (plan, reaction_count) = build_plan(&conn, &ctx, &db_path)?;
+        let BuiltPlan {
+            plan,
+            reactions: reaction_count,
+            ..
+        } = build_plan(&conn, &ctx, &db_path)?;
         Ok(DeletePreview {
             reaction_count,
             message_count: plan.message_rowids.len() as u64,
@@ -308,7 +336,7 @@ pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppErro
     .await
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteScope {
     /// Delete both messages and their attachment records/files (default).
@@ -394,30 +422,48 @@ pub struct DeleteResult {
     pub backup_verified: bool,
 }
 
-/// Returns whether a matching backup ran, or errors if none did and the
-/// caller didn't explicitly opt out. The snapshot only covers chat.db, so
-/// when attachment files will be unlinked the backup must have copied them.
+/// Returns whether a matching backup exists, or errors if none does and
+/// the caller didn't explicitly opt out. The snapshot only covers chat.db,
+/// so when attachment files will be unlinked the backup must have copied
+/// them.
 pub(crate) fn check_backup_gate(
-    receipts: &BackupReceipts,
-    filter: &FilterSpec,
+    coverage: &Coverage,
     scope: &DeleteScope,
     acknowledge_skip_backup: bool,
 ) -> Result<bool, AppError> {
-    let key = filter.key();
     let deletes_files = !matches!(scope, DeleteScope::MessagesOnly);
-    let verified = receipts.covers(&key, deletes_files);
+    let verified = coverage.covered && (coverage.with_attachments || !deletes_files);
     if verified || acknowledge_skip_backup {
         return Ok(verified);
     }
-    let msg = if deletes_files && receipts.covers(&key, false) {
-        "The backup for this filter didn't copy attachment files, and this delete removes \
-         them permanently (the safety snapshot only covers chat.db). Re-run the backup with \
-         attachments, or pass acknowledgeSkipBackup=true to proceed anyway."
+    let msg = if coverage.covered {
+        "The backup of these messages didn't copy every attachment file, and this delete \
+         removes them permanently (the safety snapshot only covers chat.db). Re-run the backup \
+         with attachments, or pass acknowledgeSkipBackup=true to proceed anyway."
     } else {
-        "No backup has been run for this filter. Run a backup first, or pass \
-         acknowledgeSkipBackup=true to proceed without one."
+        "No backup covers exactly the messages this delete removes (new messages may have \
+         arrived since the last one). Run a backup first, or pass acknowledgeSkipBackup=true \
+         to proceed without one."
     };
     Err(AppError::Other(msg.into()))
+}
+
+/// Whether completed backups cover what `filter` currently matches. Lets
+/// the UI show the real state (including backups from earlier sessions)
+/// instead of guessing from the last backup it ran.
+#[tauri::command]
+pub async fn backup_coverage(
+    receipts: State<'_, BackupReceipts>,
+    filter: FilterSpec,
+) -> Result<Coverage, AppError> {
+    let db_path = default_chat_db_path()?;
+    let ctx = filter.to_query_context()?;
+    let content = blocking(move || {
+        let conn = open_read(&db_path)?;
+        Ok(filter_content(&conn, &ctx, &db_path)?.1)
+    })
+    .await?;
+    Ok(receipts.coverage(&filter.key(), &content))
 }
 
 fn ensure_messages_not_running() -> Result<(), AppError> {
@@ -429,6 +475,65 @@ fn ensure_messages_not_running() -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// Everything `run_delete` works out from chat.db before deciding whether
+/// to go ahead.
+struct Prepared {
+    /// The scoped plan.
+    plan: DeletePlan,
+    scope: DeleteScope,
+    /// What the filter matches, for the backup gate.
+    content: ContentFingerprint,
+    /// Attachments a messages-only delete keeps (and must protect).
+    keep_attachments: Vec<i64>,
+    /// Messages whose attachment flag may need clearing afterwards.
+    flag_candidates: Vec<i64>,
+    not_on_mac: u64,
+}
+
+fn prepare_delete(
+    db_path: &std::path::Path,
+    ctx: &QueryContext,
+    scope: &DeleteScope,
+    (expected_messages, expected_attachments): (Option<u64>, Option<u64>),
+) -> Result<Prepared, AppError> {
+    // Build the delete plan against a read-only connection — even though
+    // we'll execute it against a writable one, there's no reason to hold
+    // two writers, and the read-only path is more conservative.
+    let conn = open_read(db_path)?;
+    let BuiltPlan {
+        mut plan, content, ..
+    } = build_plan(&conn, ctx, db_path)?;
+
+    // A messages-only delete also drops the message_attachment_join rows,
+    // leaving the kept attachments unlinked; the orphan cleaner must skip
+    // them.
+    let keep_attachments = if matches!(scope, DeleteScope::MessagesOnly) {
+        plan.attachment_rowids.clone()
+    } else {
+        Vec::new()
+    };
+
+    apply_scope(&mut plan, scope);
+
+    // Gate 3: the plan must match what the user confirmed.
+    check_expected_counts(&plan, expected_messages, expected_attachments)?;
+
+    let not_on_mac = count_not_on_mac(&conn, &plan)?;
+    let flag_candidates = if matches!(scope, DeleteScope::AttachmentsOnly) {
+        messages_linked_to(&conn, &plan.attachment_rowids)?
+    } else {
+        Vec::new()
+    };
+    Ok(Prepared {
+        plan,
+        scope: *scope,
+        content,
+        keep_attachments,
+        flag_candidates,
+        not_on_mac,
+    })
 }
 
 /// Execute a delete. Enforces the full safety contract: typed
@@ -453,14 +558,6 @@ pub async fn run_delete(
             "confirmation phrase must be exactly '{DELETE_CONFIRMATION_PHRASE}'"
         )));
     }
-
-    // Gate 1a: backup gate.
-    let backup_verified = check_backup_gate(
-        &receipts,
-        &args.filter,
-        &args.delete_scope,
-        args.acknowledge_skip_backup,
-    )?;
 
     // Gate 2: Messages.app must be quit.
     ensure_messages_not_running()?;
@@ -496,47 +593,37 @@ pub async fn run_delete(
     };
     let retained = RetainedAttachments::for_app(&app)?;
 
+    let filter_key = args.filter.key();
+    let scope = args.delete_scope;
+    let expected = (args.expected_message_count, args.expected_attachment_count);
+    let prepared = blocking(move || prepare_delete(&db_path, &ctx, &scope, expected)).await?;
+
+    // Gate 3b: backup gate, against the exact content being deleted — a
+    // backup of the same filter taken before newer messages arrived doesn't
+    // cover them.
+    let coverage = receipts.coverage(&filter_key, &prepared.content);
+    let backup_verified =
+        check_backup_gate(&coverage, &prepared.scope, args.acknowledge_skip_backup)?;
+
+    // Gate 3c: attachments that exist only in iCloud can't be backed up
+    // and become unrecoverable once their records are gone.
+    if prepared.not_on_mac > 0 && !args.acknowledge_not_on_mac {
+        return Err(AppError::Other(format!(
+            "{} attachments in this delete aren't downloaded to this Mac, so no backup can \
+             include them and they can't be recovered afterwards. Download them in Messages \
+             first, or pass acknowledgeNotOnMac=true to delete them anyway.",
+            prepared.not_on_mac
+        )));
+    }
+
+    let db_path = default_chat_db_path()?;
     blocking(move || {
-        // Build the delete plan against a read-only connection — even
-        // though we'll execute it against a writable one, there's no reason
-        // to hold two writers, and the read-only path is more conservative.
-        let read_conn = open_read(&db_path)?;
-        let (mut plan, _) = build_plan(&read_conn, &ctx, &db_path)?;
-
-        // A messages-only delete also drops the message_attachment_join
-        // rows, leaving the kept attachments unlinked; the orphan cleaner
-        // must skip them.
-        let keep_attachments = if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
-            plan.attachment_rowids.clone()
-        } else {
-            Vec::new()
-        };
-
-        apply_scope(&mut plan, &args.delete_scope);
-
-        // Gate 3: the plan must match what the user confirmed.
-        check_expected_counts(
-            &plan,
-            args.expected_message_count,
-            args.expected_attachment_count,
-        )?;
-
-        // Gate 3a: attachments that exist only in iCloud can't be backed up
-        // and become unrecoverable once their records are gone.
-        let not_on_mac = count_not_on_mac(&read_conn, &plan)?;
-        let flag_candidates = if matches!(args.delete_scope, DeleteScope::AttachmentsOnly) {
-            messages_linked_to(&read_conn, &plan.attachment_rowids)?
-        } else {
-            Vec::new()
-        };
-        drop(read_conn);
-        if not_on_mac > 0 && !args.acknowledge_not_on_mac {
-            return Err(AppError::Other(format!(
-                "{not_on_mac} attachments in this delete aren't downloaded to this Mac, so no \
-                 backup can include them and they can't be recovered afterwards. Download them \
-                 in Messages first, or pass acknowledgeNotOnMac=true to delete them anyway."
-            )));
-        }
+        let Prepared {
+            plan,
+            keep_attachments,
+            flag_candidates,
+            ..
+        } = prepared;
 
         // Gate 4: mandatory WAL checkpoint + snapshot.
         checkpoint_wal(&db_path)?;
@@ -767,31 +854,52 @@ mod tests {
 
     #[test]
     fn backup_gate_requires_matching_backup_with_attachments_when_deleting_files() {
-        let receipts = BackupReceipts::default();
-        let filter = FilterSpec::default();
-        let gate =
-            |scope: DeleteScope, ack: bool| check_backup_gate(&receipts, &filter, &scope, ack);
+        let none = Coverage::default();
+        let refs_only = Coverage {
+            covered: true,
+            with_attachments: false,
+            export_path: None,
+        };
+        let full = Coverage {
+            covered: true,
+            with_attachments: true,
+            export_path: None,
+        };
 
-        assert!(gate(DeleteScope::Both, false).is_err());
-        assert!(!gate(DeleteScope::Both, true).unwrap());
+        assert!(check_backup_gate(&none, &DeleteScope::Both, false).is_err());
+        assert!(!check_backup_gate(&none, &DeleteScope::Both, true).unwrap());
 
         // A references-only backup covers a messages-only delete…
-        let backup_dir = tempfile::TempDir::new().unwrap();
-        receipts.record(filter.key(), false, backup_dir.path());
-        assert!(gate(DeleteScope::MessagesOnly, false).unwrap());
+        assert!(check_backup_gate(&refs_only, &DeleteScope::MessagesOnly, false).unwrap());
         // …but not one that unlinks attachment files.
-        let err = gate(DeleteScope::AttachmentsOnly, false).unwrap_err();
-        assert!(matches!(err, AppError::Other(m) if m.contains("didn't copy attachment")));
+        let err = check_backup_gate(&refs_only, &DeleteScope::AttachmentsOnly, false).unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("didn't copy every attachment")));
 
-        receipts.record(filter.key(), true, backup_dir.path());
-        assert!(gate(DeleteScope::Both, false).unwrap());
+        assert!(check_backup_gate(&full, &DeleteScope::Both, false).unwrap());
+    }
 
-        // A backup for a different filter doesn't count.
-        let other = FilterSpec {
-            chat_ids: Some(vec![7]),
-            ..Default::default()
-        };
-        assert!(check_backup_gate(&receipts, &other, &DeleteScope::Both, false).is_err());
+    #[test]
+    fn backup_stops_covering_once_new_messages_match_the_filter() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        let backup_dir = tempfile::TempDir::new().unwrap();
+        let receipts = BackupReceipts::default();
+        let filter = FilterSpec::default();
+        let ctx = filter.to_query_context().unwrap();
+
+        let (_, at_backup) = filter_content(&conn, &ctx, &db_path).unwrap();
+        receipts.record(filter.key(), at_backup, true, backup_dir.path());
+        let content = build_plan(&conn, &ctx, &db_path).unwrap().content;
+        assert!(receipts.coverage(&filter.key(), &content).with_attachments);
+
+        // A message arrives after the backup; same filter, new content.
+        conn.execute_batch(
+            "INSERT INTO message (ROWID, guid, date) VALUES (3, 'g3', 0);
+             INSERT INTO chat_message_join VALUES (1, 3);",
+        )
+        .unwrap();
+        let content = build_plan(&conn, &ctx, &db_path).unwrap().content;
+        assert!(!receipts.coverage(&filter.key(), &content).covered);
     }
 
     #[test]
@@ -910,7 +1018,9 @@ mod tests {
 
         let mut ctx = QueryContext::default();
         ctx.set_selected_chat_ids(std::collections::BTreeSet::from([1]));
-        let (plan, reactions) = build_plan(&conn, &ctx, &db_path).unwrap();
+        let BuiltPlan {
+            plan, reactions, ..
+        } = build_plan(&conn, &ctx, &db_path).unwrap();
         assert_eq!(plan.message_rowids, vec![1, 2, 10]);
         assert_eq!(reactions, 1);
     }
@@ -919,7 +1029,9 @@ mod tests {
     fn reactions_are_skipped_on_schemas_without_them() {
         let (_tmp, db_path, _att) = fresh_fixture();
         let conn = Connection::open(&db_path).unwrap();
-        let (plan, _) = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        let plan = build_plan(&conn, &QueryContext::default(), &db_path)
+            .unwrap()
+            .plan;
         assert_eq!(plan.message_rowids, vec![1, 2]);
     }
 
@@ -932,7 +1044,9 @@ mod tests {
              INSERT INTO message_attachment_join VALUES (1, 2), (1, 3);",
         )
         .unwrap();
-        let (plan, _) = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        let plan = build_plan(&conn, &QueryContext::default(), &db_path)
+            .unwrap()
+            .plan;
         // Row 1's file exists, row 2's doesn't, row 3 has no file at all.
         assert_eq!(count_not_on_mac(&conn, &plan).unwrap(), 1);
     }
