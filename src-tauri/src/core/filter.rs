@@ -54,6 +54,21 @@ fn non_empty_set(ids: Option<&Vec<i32>>) -> Option<BTreeSet<i32>> {
         .filter(|s| !s.is_empty())
 }
 
+/// The library filters with `date <= end`, where `end` is local midnight at
+/// the *start* of the given day — so a plain `set_end("2020-12-31")` would
+/// leave out everything sent on Dec 31. Users mean "through the end of that
+/// day", so set the bound to one nanosecond before the following midnight.
+fn set_inclusive_end(ctx: &mut QueryContext, end: &str) -> Result<(), AppError> {
+    let invalid = |e: &dyn std::fmt::Display| AppError::Other(format!("invalid end date: {e}"));
+    let day =
+        chrono::NaiveDate::parse_from_str(end.trim(), "%Y-%m-%d").map_err(|_| invalid(&end))?;
+    let next = day.succ_opt().ok_or_else(|| invalid(&end))?;
+    ctx.set_end(&next.format("%Y-%m-%d").to_string())
+        .map_err(|e| invalid(&e))?;
+    ctx.end = ctx.end.map(|ns| ns - 1);
+    Ok(())
+}
+
 impl FilterSpec {
     pub fn key(&self) -> FilterKey {
         let range = self.date_range.as_ref();
@@ -74,8 +89,7 @@ impl FilterSpec {
                     .map_err(|e| AppError::Other(format!("invalid start date: {e}")))?;
             }
             if let Some(e) = range.end.as_deref().filter(|v| !v.is_empty()) {
-                ctx.set_end(e)
-                    .map_err(|e| AppError::Other(format!("invalid end date: {e}")))?;
+                set_inclusive_end(&mut ctx, e)?;
             }
         }
 
@@ -118,6 +132,47 @@ mod tests {
             spec(Some(""), Some(vec![])).key(),
             FilterSpec::default().key()
         );
+    }
+
+    fn ctx_for(start: Option<&str>, end: Option<&str>) -> QueryContext {
+        FilterSpec {
+            date_range: Some(DateRange {
+                start: start.map(str::to_string),
+                end: end.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+        .to_query_context()
+        .unwrap()
+    }
+
+    #[test]
+    fn end_date_includes_the_whole_end_day() {
+        // End of 2020-05-15 is one nanosecond before the start of 2020-05-16.
+        let end = ctx_for(None, Some("2020-05-15")).end.unwrap();
+        let next_start = ctx_for(Some("2020-05-16"), None).start.unwrap();
+        let same_start = ctx_for(Some("2020-05-15"), None).start.unwrap();
+        assert_eq!(end, next_start - 1);
+        assert!(end > same_start);
+    }
+
+    #[test]
+    fn end_date_rolls_over_month_and_year() {
+        let end = ctx_for(None, Some("2020-12-31")).end.unwrap();
+        let next_start = ctx_for(Some("2021-01-01"), None).start.unwrap();
+        assert_eq!(end, next_start - 1);
+    }
+
+    #[test]
+    fn invalid_end_date_is_rejected() {
+        let spec = FilterSpec {
+            date_range: Some(DateRange {
+                start: None,
+                end: Some("2020-02-30".into()),
+            }),
+            ..Default::default()
+        };
+        assert!(spec.to_query_context().is_err());
     }
 
     #[test]

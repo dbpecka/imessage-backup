@@ -15,7 +15,9 @@ use crate::core::attachment_files::{
 use crate::core::db_path::default_chat_db_path;
 use crate::core::messages_app::is_messages_running;
 use crate::core::retained::RetainedAttachments;
-use crate::core::snapshot::{checkpoint_wal, default_snapshot_root, snapshot_chat_db};
+use crate::core::snapshot::{
+    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SNAPSHOTS_TO_KEEP,
+};
 use crate::error::AppError;
 
 /// Files newer than this are never treated as filesystem orphans: Messages
@@ -30,6 +32,10 @@ pub struct OrphanScan {
     pub db_orphan_bytes: u64,
     pub fs_orphan_count: u64,
     pub fs_orphan_bytes: u64,
+    /// Unlinked attachments the user kept via a messages-only delete. Not
+    /// included in the counts above unless the scan asked for them.
+    pub retained_count: u64,
+    pub retained_bytes: u64,
     /// Identifies the exact set of orphans found. `clean_orphans` refuses to
     /// run unless it finds the same set, so it can only ever delete what the
     /// user reviewed.
@@ -41,6 +47,10 @@ pub struct OrphanScan {
 pub struct CleanOrphansArgs {
     /// `fingerprint` from the `scan_orphans` result the user confirmed.
     pub scan_fingerprint: String,
+    /// Also remove attachments kept by earlier messages-only deletes. Must
+    /// match the `include_retained` the scan ran with.
+    #[serde(default)]
+    pub include_retained: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +84,14 @@ struct Orphans {
     db_bytes: u64,
     fs: Vec<PathBuf>,
     fs_bytes: u64,
+    /// Retained (kept) unlinked attachments left out of `db`.
+    retained_count: u64,
+    retained_bytes: u64,
+    /// Retained ids included in `db` because the caller asked for them.
+    included_retained: Vec<i64>,
+    /// Retained ids that no longer name an unlinked row (deleted, or linked
+    /// to a message again) and can be dropped from the list.
+    stale_retained: Vec<i64>,
 }
 
 impl Orphans {
@@ -134,6 +152,7 @@ fn file_len(path: &Path) -> u64 {
 fn find_orphans(
     conn: &Connection,
     retained: &BTreeSet<i64>,
+    include_retained: bool,
     roots: &[PathBuf],
     now: SystemTime,
 ) -> Result<Orphans, AppError> {
@@ -150,6 +169,8 @@ fn find_orphans(
     let mut referenced_dirs: HashSet<String> = HashSet::new();
     let mut kept_files: HashSet<String> = HashSet::new();
     let mut candidates: Vec<(i64, Option<PathBuf>)> = Vec::new();
+    let mut unlinked_retained: HashSet<i64> = HashSet::new();
+    let mut out = Orphans::default();
 
     for (rowid, filename, linked) in rows {
         let path = filename.as_deref().map(expand_tilde);
@@ -158,16 +179,33 @@ fn find_orphans(
                 referenced_dirs.insert(path_key(parent));
             }
         }
-        if linked || retained.contains(&rowid) {
+        let is_retained = !linked && retained.contains(&rowid);
+        if is_retained {
+            unlinked_retained.insert(rowid);
+        }
+        if linked || (is_retained && !include_retained) {
             if let Some(p) = &path {
                 kept_files.insert(path_key(p));
+                if is_retained && is_within_roots(p, roots) {
+                    out.retained_bytes = out.retained_bytes.saturating_add(file_len(p));
+                }
+            }
+            if is_retained {
+                out.retained_count += 1;
             }
         } else {
+            if is_retained {
+                out.included_retained.push(rowid);
+            }
             candidates.push((rowid, path));
         }
     }
+    out.stale_retained = retained
+        .iter()
+        .copied()
+        .filter(|id| !unlinked_retained.contains(id))
+        .collect();
 
-    let mut out = Orphans::default();
     for (rowid, path) in candidates {
         let path = path.filter(|p| is_within_roots(p, roots) && !kept_files.contains(&path_key(p)));
         if let Some(p) = &path {
@@ -193,17 +231,29 @@ fn find_orphans(
 }
 
 #[tauri::command]
-pub async fn scan_orphans(app: AppHandle) -> Result<OrphanScan, AppError> {
+pub async fn scan_orphans(app: AppHandle, include_retained: bool) -> Result<OrphanScan, AppError> {
     let db_path = default_chat_db_path()?;
     let conn = get_connection(&db_path)?;
-    let retained = RetainedAttachments::for_app(&app)?.load()?;
-    let orphans = find_orphans(&conn, &retained, &attachment_roots(), SystemTime::now())?;
+    let store = RetainedAttachments::for_app(&app)?;
+    let retained = store.load()?;
+    let orphans = find_orphans(
+        &conn,
+        &retained,
+        include_retained,
+        &attachment_roots(),
+        SystemTime::now(),
+    )?;
+    // Housekeeping: forget kept attachments that were since deleted or
+    // linked to a message again, so the list doesn't grow forever.
+    store.remove(&orphans.stale_retained)?;
 
     Ok(OrphanScan {
         db_orphan_count: orphans.db.len() as u64,
         db_orphan_bytes: orphans.db_bytes,
         fs_orphan_count: orphans.fs.len() as u64,
         fs_orphan_bytes: orphans.fs_bytes,
+        retained_count: orphans.retained_count,
+        retained_bytes: orphans.retained_bytes,
         fingerprint: orphans.fingerprint(),
     })
 }
@@ -236,11 +286,18 @@ pub async fn clean_orphans(
 
     let db_path = default_chat_db_path()?;
     let roots = attachment_roots();
-    let retained = RetainedAttachments::for_app(&app)?.load()?;
+    let store = RetainedAttachments::for_app(&app)?;
+    let retained = store.load()?;
 
     let orphans = {
         let conn = get_connection(&db_path)?;
-        find_orphans(&conn, &retained, &roots, SystemTime::now())?
+        find_orphans(
+            &conn,
+            &retained,
+            args.include_retained,
+            &roots,
+            SystemTime::now(),
+        )?
         // conn dropped here
     };
     if orphans.fingerprint() != args.scan_fingerprint {
@@ -255,7 +312,9 @@ pub async fn clean_orphans(
     let mut snapshot_path = None;
     if !orphans.db.is_empty() {
         checkpoint_wal(&db_path)?;
-        let snapshot = snapshot_chat_db(&db_path, &default_snapshot_root()?)?;
+        let snapshot_root = default_snapshot_root(&app)?;
+        let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
+        prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
         snapshot_path = Some(snapshot.dir.display().to_string());
 
         ensure_messages_not_running()?;
@@ -274,6 +333,8 @@ pub async fn clean_orphans(
             }
         }
         tx.commit()?;
+        // The included kept attachments are gone now; stop tracking them.
+        store.remove(&orphans.included_retained)?;
     }
 
     let mut files_skipped = 0u64;
@@ -363,7 +424,7 @@ mod tests {
         let stray = file(&root.join("cd/02/GUID-2/old.jpg"));
         add_row(&conn, 1, &heic, true);
 
-        let o = find_orphans(&conn, &BTreeSet::new(), &[root], later()).unwrap();
+        let o = find_orphans(&conn, &BTreeSet::new(), false, &[root], later()).unwrap();
         assert!(o.db.is_empty());
         assert_eq!(o.fs, vec![stray]);
     }
@@ -376,7 +437,7 @@ mod tests {
         let db_spelling = PathBuf::from(real.to_str().unwrap().replace("GUID-1", "guid-1"));
         add_row(&conn, 1, &db_spelling, true);
 
-        let o = find_orphans(&conn, &BTreeSet::new(), &[root], later()).unwrap();
+        let o = find_orphans(&conn, &BTreeSet::new(), false, &[root], later()).unwrap();
         assert!(o.fs.is_empty());
     }
 
@@ -386,7 +447,7 @@ mod tests {
         let (conn, root) = fixture(&tmp);
         file(&root.join("ab/01/GUID-NEW/incoming.jpg"));
 
-        let o = find_orphans(&conn, &BTreeSet::new(), &[root], SystemTime::now()).unwrap();
+        let o = find_orphans(&conn, &BTreeSet::new(), false, &[root], SystemTime::now()).unwrap();
         assert!(o.fs.is_empty());
     }
 
@@ -406,11 +467,45 @@ mod tests {
         add_row(&conn, 6, &solo, false); // orphan with its own file
         let retained = BTreeSet::from([5]);
 
-        let o = find_orphans(&conn, &retained, &[root], later()).unwrap();
+        let o = find_orphans(
+            &conn,
+            &retained,
+            false,
+            std::slice::from_ref(&root),
+            later(),
+        )
+        .unwrap();
         let got: Vec<(i64, Option<PathBuf>)> =
             o.db.iter().map(|d| (d.rowid, d.path.clone())).collect();
         // Row 5 is retained, so its file (shared with orphan row 3) is kept.
         assert_eq!(got, vec![(2, None), (3, None), (4, None), (6, Some(solo))]);
+        assert_eq!(o.retained_count, 1);
+        assert!(o.included_retained.is_empty());
+
+        // Opting in turns the kept attachment (and the file it shares with
+        // row 3) into cleanup candidates.
+        let o = find_orphans(&conn, &retained, true, &[root], later()).unwrap();
+        let ids: Vec<i64> = o.db.iter().map(|d| d.rowid).collect();
+        assert_eq!(ids, vec![2, 3, 4, 5, 6]);
+        assert_eq!(o.included_retained, vec![5]);
+        assert_eq!(o.retained_count, 0);
+        assert!(o
+            .db
+            .iter()
+            .any(|d| d.rowid == 3 && d.path == Some(own.clone())));
+    }
+
+    #[test]
+    fn stale_retained_ids_are_reported() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, root) = fixture(&tmp);
+        let a = file(&root.join("ab/01/G/a.jpg"));
+        add_row(&conn, 1, &a, true); // relinked
+        add_row(&conn, 2, &a, false); // still kept & unlinked
+        let retained = BTreeSet::from([1, 2, 99]); // 99 no longer exists
+
+        let o = find_orphans(&conn, &retained, false, &[root], later()).unwrap();
+        assert_eq!(o.stale_retained, vec![1, 99]);
     }
 
     #[test]
@@ -420,16 +515,16 @@ mod tests {
         let a = file(&root.join("ab/01/G/a.jpg"));
         add_row(&conn, 1, &a, false);
         let roots = [root];
-        let f1 = find_orphans(&conn, &BTreeSet::new(), &roots, later())
+        let f1 = find_orphans(&conn, &BTreeSet::new(), false, &roots, later())
             .unwrap()
             .fingerprint();
-        let f2 = find_orphans(&conn, &BTreeSet::new(), &roots, later())
+        let f2 = find_orphans(&conn, &BTreeSet::new(), false, &roots, later())
             .unwrap()
             .fingerprint();
         assert_eq!(f1, f2);
 
         add_row(&conn, 2, &a, false);
-        let f3 = find_orphans(&conn, &BTreeSet::new(), &roots, later())
+        let f3 = find_orphans(&conn, &BTreeSet::new(), false, &roots, later())
             .unwrap()
             .fingerprint();
         assert_ne!(f1, f3);

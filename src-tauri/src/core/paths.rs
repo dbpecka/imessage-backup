@@ -7,7 +7,11 @@ use crate::error::AppError;
 /// - path must not be empty
 /// - path must be absolute (Tauri's native file picker always produces
 ///   absolute paths; a relative path on the IPC wire is suspicious)
-/// - path must resolve under the user's `$HOME`
+/// - path must resolve under the user's `$HOME` or onto a mounted volume
+///   under `/Volumes/<name>/` (external drives are the natural place for an
+///   archive)
+/// - path must not be inside `~/Library/Messages`, where an export would
+///   mix with live data (and look like orphaned attachments)
 ///
 /// Returns the canonicalised path on success. Non-existent destinations are
 /// permitted — we canonicalise the longest existing prefix and append the
@@ -29,14 +33,32 @@ pub fn validate_user_path(raw: &str, purpose: &str) -> Result<PathBuf, AppError>
     let home = canonical_or_self(Path::new(&home));
     let canonical = canonical_prefix(&p);
 
-    if !canonical.starts_with(&home) {
+    let messages_dir = home.join("Library/Messages");
+    if canonical.starts_with(&messages_dir) {
         return Err(AppError::Other(format!(
-            "{purpose} must be inside your home directory ({}): {raw}",
+            "{purpose} can't be inside {}: {raw}",
+            messages_dir.display()
+        )));
+    }
+
+    if !canonical.starts_with(&home) && !is_on_mounted_volume(&canonical) {
+        return Err(AppError::Other(format!(
+            "{purpose} must be inside your home directory ({}) or on an external drive: {raw}",
             home.display()
         )));
     }
 
     Ok(canonical)
+}
+
+/// `true` for paths inside a volume mounted at `/Volumes/<name>`. The boot
+/// volume's `/Volumes/Macintosh HD` entry is a symlink to `/`, so it
+/// canonicalises away and is not accepted here.
+fn is_on_mounted_volume(canonical: &Path) -> bool {
+    canonical
+        .strip_prefix("/Volumes")
+        .map(|rest| rest.components().count() >= 1)
+        .unwrap_or(false)
 }
 
 /// Canonicalise as much of `path` as already exists; preserve the rest.
@@ -97,6 +119,27 @@ mod tests {
         let resolved = validate_user_path(&target, "destination").unwrap();
         assert!(resolved.starts_with(&home));
         assert!(resolved.ends_with("nested/path"));
+    }
+
+    #[test]
+    fn accepts_external_volume() {
+        let resolved =
+            validate_user_path("/Volumes/BubbleWrapTestDrive/archive", "destination").unwrap();
+        assert!(resolved.ends_with("BubbleWrapTestDrive/archive"));
+    }
+
+    #[test]
+    fn rejects_volumes_root() {
+        let err = validate_user_path("/Volumes", "destination").unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("external drive")));
+    }
+
+    #[test]
+    fn rejects_messages_library() {
+        let home = std::env::var("HOME").unwrap();
+        let target = format!("{home}/Library/Messages/Attachments/export");
+        let err = validate_user_path(&target, "destination").unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("can't be inside")));
     }
 
     #[test]

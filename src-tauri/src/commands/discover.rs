@@ -22,14 +22,19 @@ pub struct ProbeResult {
 pub async fn probe_db() -> Result<ProbeResult, AppError> {
     let path = default_chat_db_path()?;
 
-    if !path.exists() {
-        return Err(AppError::Other(format!(
-            "chat.db not found at {}",
-            path.display()
-        )));
-    }
-
     let path_str = path.display().to_string();
+
+    // See `check_fda`: `exists()` would report a TCC denial as "not found".
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(AppError::FullDiskAccess { path: path_str });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::Other(format!("chat.db not found at {path_str}")));
+        }
+        Err(e) => return Err(AppError::from(e)),
+    }
 
     let conn = match get_connection(&path) {
         Ok(c) => c,
@@ -141,8 +146,7 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
         .into_iter()
         .map(|(rowid, c)| {
             #[cfg(target_os = "macos")]
-            let contact_name =
-                crate::core::contacts::lookup_contact_name(&c.chat_identifier, &contact_map);
+            let contact_name = contact_map.lookup(&c.chat_identifier);
             #[cfg(not(target_os = "macos"))]
             let contact_name: Option<String> = None;
 

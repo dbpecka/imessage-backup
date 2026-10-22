@@ -154,6 +154,12 @@ export type RunDeleteArgs = {
   deleteScope?: DeleteScope;
   /** Must be true unless Messages in iCloud is detected as disabled. */
   acknowledgeIcloudSync?: boolean;
+  /**
+   * Counts the user confirmed (0 for parts the scope keeps). The backend
+   * refuses if its plan differs, e.g. because the filter changed.
+   */
+  expectedMessageCount?: number;
+  expectedAttachmentCount?: number;
 };
 
 export type DeleteResult = {
@@ -175,6 +181,9 @@ export type OrphanScan = {
   dbOrphanBytes: number;
   fsOrphanCount: number;
   fsOrphanBytes: number;
+  /** Attachments kept by earlier messages-only deletes (excluded unless asked). */
+  retainedCount: number;
+  retainedBytes: number;
   /** Pass back to cleanOrphans; it refuses if the orphans changed since. */
   fingerprint: string;
 };
@@ -202,7 +211,8 @@ export const api = {
   safetyStatus: () => invoke<SafetyStatus>('safety_status'),
   previewDelete: (filter: FilterSpec) => invoke<DeletePreview>('preview_delete', { filter }),
   runDelete: (args: RunDeleteArgs) => invoke<DeleteResult>('run_delete', { args }),
-  scanOrphans: () => invoke<OrphanScan>('scan_orphans'),
-  cleanOrphans: (scanFingerprint: string) =>
-    invoke<OrphanCleanResult>('clean_orphans', { args: { scanFingerprint } }),
+  scanOrphans: (includeRetained = false) =>
+    invoke<OrphanScan>('scan_orphans', { includeRetained }),
+  cleanOrphans: (scanFingerprint: string, includeRetained = false) =>
+    invoke<OrphanCleanResult>('clean_orphans', { args: { scanFingerprint, includeRetained } }),
 };

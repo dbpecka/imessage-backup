@@ -45,19 +45,42 @@ impl RetainedAttachments {
         }
     }
 
-    /// Merge `ids` into the persisted set. Written via a temp file + rename
-    /// so a crash can't leave a truncated list behind.
-    pub fn add(&self, ids: &[i64]) -> Result<(), AppError> {
+    /// Merge `ids` into the persisted set and return the ones that weren't
+    /// already in it, so a caller can undo exactly its own addition with
+    /// [`Self::remove`].
+    pub fn add(&self, ids: &[i64]) -> Result<Vec<i64>, AppError> {
+        let mut set = self.load()?;
+        let added: Vec<i64> = ids.iter().copied().filter(|id| set.insert(*id)).collect();
+        if !added.is_empty() {
+            self.save(&set)?;
+        }
+        Ok(added)
+    }
+
+    /// Remove `ids` from the persisted set.
+    pub fn remove(&self, ids: &[i64]) -> Result<(), AppError> {
         if ids.is_empty() {
             return Ok(());
         }
         let mut set = self.load()?;
-        set.extend(ids.iter().copied());
+        let before = set.len();
+        for id in ids {
+            set.remove(id);
+        }
+        if set.len() != before {
+            self.save(&set)?;
+        }
+        Ok(())
+    }
+
+    /// Written via a temp file + rename so a crash can't leave a truncated
+    /// list behind.
+    fn save(&self, set: &BTreeSet<i64>) -> Result<(), AppError> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        let json = serde_json::to_vec(&set).map_err(|e| AppError::Other(e.to_string()))?;
+        let json = serde_json::to_vec(set).map_err(|e| AppError::Other(e.to_string()))?;
         fs::write(&tmp, json)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -74,8 +97,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r = RetainedAttachments::in_dir(&tmp.path().join("nested"));
         assert!(r.load().unwrap().is_empty());
-        r.add(&[3, 1]).unwrap();
-        r.add(&[2, 3]).unwrap();
+        assert_eq!(r.add(&[3, 1]).unwrap(), vec![3, 1]);
+        assert_eq!(r.add(&[2, 3]).unwrap(), vec![2]);
         assert_eq!(r.load().unwrap(), BTreeSet::from([1, 2, 3]));
+
+        // Undoing the second add leaves ids that were already there.
+        r.remove(&[2]).unwrap();
+        assert_eq!(r.load().unwrap(), BTreeSet::from([1, 3]));
     }
 }
