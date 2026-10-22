@@ -75,7 +75,7 @@ pub fn snapshot_chat_db(chat_db: &Path, snapshot_root: &Path) -> Result<Snapshot
 /// already exists. Two snapshots in the same second must never share a
 /// folder, or the second would overwrite the only pre-delete copy taken by
 /// the first.
-fn create_unique_dir(root: &Path, base: &str) -> Result<PathBuf, AppError> {
+pub fn create_unique_dir(root: &Path, base: &str) -> Result<PathBuf, AppError> {
     fs::create_dir_all(root)?;
     let mut dir = root.join(base);
     let mut n = 1u32;
@@ -96,28 +96,43 @@ fn create_unique_dir(root: &Path, base: &str) -> Result<PathBuf, AppError> {
 /// the snapshot itself no longer depends on it (we use the SQLite backup
 /// API, which is WAL-safe).
 pub fn checkpoint_wal(chat_db: &Path) -> Result<(), AppError> {
-    use imessage_database::tables::table::get_writable_connection;
-    let conn = get_writable_connection(chat_db)
+    let conn = crate::core::db_path::open_write(chat_db)
         .map_err(|e| AppError::Other(format!("failed to open for checkpoint: {e}")))?;
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
         .map_err(|e| AppError::Other(format!("wal_checkpoint failed: {e}")))?;
     Ok(())
 }
 
-/// Default snapshot root: `<app data dir>/snapshots`, i.e.
-/// `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots`.
+/// What a snapshot was taken for. Each kind gets its own folder and is
+/// pruned on its own, so routine orphan cleanups can never push out the
+/// snapshot taken before a message delete.
+#[derive(Debug, Clone, Copy)]
+pub enum SnapshotKind {
+    Delete,
+    OrphanClean,
+}
+
+/// Default snapshot root: `<app data dir>/snapshots/<kind>`, i.e.
+/// `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/delete`.
 /// Deliberately not under `~/Documents`, which "Desktop & Documents in
 /// iCloud" uploads to iCloud Drive and may evict from local disk.
-pub fn default_snapshot_root(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
+pub fn default_snapshot_root(
+    app: &tauri::AppHandle,
+    kind: SnapshotKind,
+) -> Result<PathBuf, AppError> {
     use tauri::Manager;
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Other(format!("cannot locate app data directory: {e}")))?;
-    Ok(dir.join("snapshots"))
+    let sub = match kind {
+        SnapshotKind::Delete => "delete",
+        SnapshotKind::OrphanClean => "orphan-clean",
+    };
+    Ok(dir.join("snapshots").join(sub))
 }
 
-/// How many snapshots [`prune_snapshots`] keeps in the default root.
+/// How many snapshots [`prune_snapshots`] keeps per default root.
 pub const SNAPSHOTS_TO_KEEP: usize = 5;
 
 /// Remove all but the `keep` newest snapshot folders under `root`. Only

@@ -69,6 +69,8 @@ export type ChatSummary = {
   participantCount: number;
   participantHandles: string[];
   messageCount: number;
+  /** Every chat row in this conversation (e.g. iMessage + SMS); filter by all of them. */
+  chatIds: number[];
 };
 
 export type ContactSummary = {
@@ -114,8 +116,23 @@ export type BackupResult = {
   manifestPath: string;
   exportPath: string;
   format: string;
-  /** Whether attachment files were copied (not just referenced). */
+  /** Whether every attachment on this Mac was copied (none failed). */
   includesAttachments: boolean;
+  /** Per-attachment copy outcomes; null when attachments weren't copied. */
+  attachmentCopy: AttachmentCopySummary | null;
+};
+
+export type AttachmentCopySummary = {
+  attempted: number;
+  copied: number;
+  bytes: number;
+  /** File isn't on this Mac (typically offloaded to iCloud). */
+  notOnMac: number;
+  /** Record has no file path at all. */
+  unresolvable: number;
+  failed: number;
+  /** The first few failures, as "path: reason". */
+  failures: string[];
 };
 
 export type ProgressPayload = {
@@ -137,6 +154,8 @@ export type DeletePreview = {
   attachmentCount: number;
   attachmentBytes: number;
   onDiskFileCount: number;
+  /** Matched attachments whose file isn't downloaded to this Mac. */
+  notOnMacCount: number;
 };
 
 export type DeleteScope = 'both' | 'messages_only' | 'attachments_only';
@@ -154,6 +173,8 @@ export type RunDeleteArgs = {
   deleteScope?: DeleteScope;
   /** Must be true unless Messages in iCloud is detected as disabled. */
   acknowledgeIcloudSync?: boolean;
+  /** Required when deleting attachments whose files aren't on this Mac. */
+  acknowledgeNotOnMac?: boolean;
   /**
    * Counts the user confirmed (0 for parts the scope keeps). The backend
    * refuses if its plan differs, e.g. because the filter changed.

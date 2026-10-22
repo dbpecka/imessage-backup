@@ -1,6 +1,5 @@
 use imessage_database::{
     exporters::{
-        attachments::copy_attachments,
         config::{AttachmentMode, ExportConfig},
         export_type::ExportType,
         json::run_json_export,
@@ -9,16 +8,25 @@ use imessage_database::{
         progress::ProgressReporter,
         runtime::Config,
     },
-    tables::{messages::message::Message, table::get_connection},
+    tables::messages::message::Message,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::core::db_path::default_chat_db_path;
+use crate::core::attachment_copy::{
+    annotate_json_export, copy_attachments, verify_runtime_copies, CopySummary,
+};
+use crate::core::db_path::{blocking, check_chat_db_access, default_chat_db_path, open_read};
 use crate::core::filter::FilterSpec;
 use crate::core::progress::TauriProgress;
 use crate::core::receipts::BackupReceipts;
+use crate::core::snapshot::create_unique_dir;
 use crate::error::AppError;
+
+fn count(r: Result<i64, imessage_database::error::table::TableError>) -> Result<u64, AppError> {
+    r.map(|n| n.max(0) as u64)
+        .map_err(|e| AppError::Other(e.to_string()))
+}
 
 pub const BACKUP_PROGRESS_EVENT: &str = "backup-progress";
 
@@ -40,15 +48,21 @@ pub struct BackupResult {
     pub attachment_bytes_copied: u64,
     pub conversation_count: u64,
     pub manifest_path: String,
+    /// The folder this run wrote into (a fresh subfolder of the chosen
+    /// destination).
     pub export_path: String,
     pub format: String,
-    /// Whether attachment files were copied into the export. A backup that
-    /// only references attachments doesn't protect them from a delete.
+    /// Whether every attachment on this Mac was copied into the export. A
+    /// backup that only references attachments, or where some copies
+    /// failed, doesn't protect them from a delete.
     pub includes_attachments: bool,
+    /// Per-attachment copy outcomes; `None` when attachments weren't copied.
+    pub attachment_copy: Option<CopySummary>,
 }
 
-/// Run a backup with the supplied filter and format to the supplied
-/// destination directory. Emits progress events on `backup-progress`.
+/// Run a backup with the supplied filter and format into a new, timestamped
+/// subfolder of the supplied destination. Emits progress events on
+/// `backup-progress`.
 #[tauri::command]
 pub async fn run_backup(
     app: AppHandle,
@@ -59,129 +73,148 @@ pub async fn run_backup(
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
 
     let db_path = default_chat_db_path()?;
+    check_chat_db_access(&db_path)?;
     let destination = crate::core::paths::validate_user_path(&args.destination, "destination")?;
     let filter_key = args.filter.key();
-    let includes_attachments = args.copy_attachments;
-
-    let config = ExportConfig {
-        db_path,
-        export_path: destination.clone(),
-        format,
-        query: args.filter.to_query_context()?,
-        attachments: if args.copy_attachments {
-            AttachmentMode::Copy
-        } else {
-            AttachmentMode::Reference
-        },
-        attachment_root: None,
-        custom_owner_name: None,
-    };
-
+    let copy = args.copy_attachments;
+    let query = args.filter.to_query_context()?;
     let progress = TauriProgress::new(app.clone(), BACKUP_PROGRESS_EVENT);
     let format_label = format.to_string();
 
-    let result = tokio::task::spawn_blocking(move || -> Result<BackupResult, AppError> {
-        match format {
-            ExportType::Json => {
-                let summary = run_json_export(&config, &progress)
-                    .map_err(|e| AppError::Other(e.to_string()))?;
-                Ok(BackupResult {
-                    message_count: summary.message_count,
-                    attachment_count: summary.attachment_count,
-                    attachment_bytes_copied: summary.attachment_bytes_copied,
-                    conversation_count: summary.conversation_count,
-                    manifest_path: summary.manifest_path.display().to_string(),
-                    export_path: config.export_path.display().to_string(),
-                    format: format_label,
-                    includes_attachments,
-                })
-            }
-            ExportType::Pdf => {
-                // Copy attachment files into {export}/attachments/<chat_id>/
-                // using the same helper JSON uses, so the PDF run leaves a
-                // browsable attachment archive next to the PDF.
-                let att_bytes = copy_attachments(&config, &progress)
-                    .map_err(|e| AppError::Other(format!("attachment copy failed: {e}")))?
-                    .bytes;
-                let summary = run_pdf_export(&config, &progress)
-                    .map_err(|e| AppError::Other(e.to_string()))?;
-                Ok(BackupResult {
-                    message_count: summary.message_count,
-                    attachment_count: summary.attachment_count,
-                    attachment_bytes_copied: att_bytes,
-                    conversation_count: summary.conversation_count,
-                    manifest_path: String::new(),
-                    export_path: config.export_path.display().to_string(),
-                    format: format_label,
-                    includes_attachments,
-                })
-            }
-            ExportType::Html | ExportType::Txt => {
-                // HTML / TXT run through the full library runtime. That
-                // path owns its own stderr-based progress bar — migrating
-                // it to `ProgressReporter` is a follow-up; for now we
-                // flip the UI into a generic "running" state and emit a
-                // finish event when start() returns.
+    let result = blocking(move || -> Result<BackupResult, AppError> {
+        // Every run gets its own folder: the JSON exporter appends to
+        // existing files (re-running into the same folder duplicated every
+        // message), and stale files from an earlier run must never be
+        // mistaken for this run's copies.
+        std::fs::create_dir_all(&destination)?;
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
+        let export_path = create_unique_dir(&destination, &format!("Bubble Wrap {stamp}"))?;
 
-                // The library's HTML/TXT runtime doesn't return a summary,
-                // so compute counts from the same filter before running.
-                // Open a scoped readonly connection; drop it before the
-                // library opens its own.
-                let (message_count, conversation_count, attachment_count) = {
-                    let conn = get_connection(&config.db_path)
-                        .map_err(|e| AppError::Other(format!("failed to open chat.db: {e}")))?;
-                    let messages = Message::get_count(&conn, &config.query)
-                        .map_err(|e| AppError::Other(e.to_string()))?
-                        .max(0) as u64;
-                    let conversations = Message::get_conversation_count(&conn, &config.query)
-                        .map_err(|e| AppError::Other(e.to_string()))?
-                        .max(0) as u64;
-                    let attachments = Message::get_attachment_count(&conn, &config.query)
-                        .map_err(|e| AppError::Other(e.to_string()))?
-                        .max(0) as u64;
-                    (messages, conversations, attachments)
-                };
+        // The library's own attachment copying is collision-prone (see
+        // `attachment_copy`), so JSON/PDF always run in reference mode and
+        // we copy separately. The HTML/TXT runtime names copies safely by
+        // rowid and links to them, so it keeps doing its own copying and we
+        // verify the result instead of copying everything twice.
+        let config = |mode: AttachmentMode| ExportConfig {
+            db_path: db_path.clone(),
+            export_path: export_path.clone(),
+            format,
+            query: query.clone(),
+            attachments: mode,
+            attachment_root: None,
+            custom_owner_name: None,
+        };
+        let export_label = export_path.display().to_string();
 
-                // Copy attachment files into {export}/attachments/<chat_id>/
-                // using the same helper JSON uses. The HTML/TXT runtime's
-                // own AttachmentManager has historically lost files for
-                // iCloud-offloaded sources and logged noisy "not found"
-                // output; this pass is the reliable one.
-                let att_summary = copy_attachments(&config, &progress)
-                    .map_err(|e| AppError::Other(format!("attachment copy failed: {e}")))?;
+        let (message_count, attachment_count, conversation_count, manifest_path, copy_summary) =
+            match format {
+                ExportType::Json => {
+                    let summary = run_json_export(&config(AttachmentMode::Reference), &progress)
+                        .map_err(|e| AppError::Other(e.to_string()))?;
+                    let copy_summary = if copy {
+                        let conn = open_read(&db_path)?;
+                        let (cs, copied) =
+                            copy_attachments(&conn, &db_path, &query, &export_path, &progress)?;
+                        annotate_json_export(&export_path, &summary.manifest_path, &copied, &cs)?;
+                        Some(cs)
+                    } else {
+                        None
+                    };
+                    (
+                        summary.message_count,
+                        summary.attachment_count,
+                        summary.conversation_count,
+                        summary.manifest_path.display().to_string(),
+                        copy_summary,
+                    )
+                }
+                ExportType::Pdf => {
+                    // Copy first so the PDF run leaves a browsable attachment
+                    // archive next to the PDF.
+                    let copy_summary = if copy {
+                        let conn = open_read(&db_path)?;
+                        Some(copy_attachments(&conn, &db_path, &query, &export_path, &progress)?.0)
+                    } else {
+                        None
+                    };
+                    let summary = run_pdf_export(&config(AttachmentMode::Reference), &progress)
+                        .map_err(|e| AppError::Other(e.to_string()))?;
+                    (
+                        summary.message_count,
+                        summary.attachment_count,
+                        summary.conversation_count,
+                        String::new(),
+                        copy_summary,
+                    )
+                }
+                ExportType::Html | ExportType::Txt => {
+                    // The library's HTML/TXT runtime doesn't return a
+                    // summary, so compute counts from the same filter first.
+                    let (messages, conversations, attachments) = {
+                        let conn = open_read(&db_path)?;
+                        (
+                            count(Message::get_count(&conn, &query))?,
+                            count(Message::get_conversation_count(&conn, &query))?,
+                            count(Message::get_attachment_count(&conn, &query))?,
+                        )
+                    };
 
-                progress.start(0);
-                progress.set_message("Running HTML/TXT export…");
+                    progress.start(0);
+                    progress.set_message("Running HTML/TXT export…");
+                    let mode = if copy {
+                        AttachmentMode::Copy
+                    } else {
+                        AttachmentMode::Reference
+                    };
+                    let options: Options = config(mode).into();
+                    let mut runtime = Config::new(options).map_err(|e| {
+                        AppError::Other(format!("failed to initialise export runtime: {e}"))
+                    })?;
+                    runtime.resolve_filtered_handles();
+                    runtime
+                        .start()
+                        .map_err(|e| AppError::Other(format!("export failed: {e}")))?;
+                    progress.finish();
 
-                let export_path = config.export_path.clone();
-                let options: Options = config.into();
-                let mut runtime = Config::new(options).map_err(|e| {
-                    AppError::Other(format!("failed to initialise export runtime: {e}"))
-                })?;
-                runtime.resolve_filtered_handles();
-                runtime
-                    .start()
-                    .map_err(|e| AppError::Other(format!("export failed: {e}")))?;
-                progress.finish();
-                Ok(BackupResult {
-                    message_count,
-                    attachment_count,
-                    attachment_bytes_copied: att_summary.bytes,
-                    conversation_count,
-                    manifest_path: String::new(),
-                    export_path: export_path.display().to_string(),
-                    format: format_label,
-                    includes_attachments,
-                })
-            }
-        }
+                    let copy_summary = if copy {
+                        let conn = open_read(&db_path)?;
+                        Some(verify_runtime_copies(
+                            &conn,
+                            &db_path,
+                            &query,
+                            &export_path,
+                        )?)
+                    } else {
+                        None
+                    };
+                    (
+                        messages,
+                        attachments,
+                        conversations,
+                        String::new(),
+                        copy_summary,
+                    )
+                }
+            };
+
+        Ok(BackupResult {
+            message_count,
+            attachment_count,
+            attachment_bytes_copied: copy_summary.as_ref().map_or(0, |c| c.bytes),
+            conversation_count,
+            manifest_path,
+            export_path: export_label,
+            format: format_label,
+            includes_attachments: copy_summary.as_ref().is_some_and(|c| c.failed == 0),
+            attachment_copy: copy_summary,
+        })
     })
-    .await
-    .map_err(|e| AppError::Other(format!("task join error: {e}")))??;
+    .await?;
 
     // Only a backup that ran to completion counts toward `run_delete`'s
-    // backup gate.
-    receipts.record(filter_key, includes_attachments);
+    // backup gate, and it only vouches for attachments if every copy that
+    // could be made was made.
+    receipts.record(filter_key, result.includes_attachments);
 
     Ok(result)
 }

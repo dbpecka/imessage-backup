@@ -1,9 +1,8 @@
-use crate::core::db_path::default_chat_db_path;
+use crate::core::db_path::{blocking, default_chat_db_path, open_read};
 use crate::core::filter::FilterSpec;
 use crate::error::AppError;
-use imessage_database::tables::{
-    table::get_connection,
-    write::{attachment_filter::AttachmentFilter, delete::preview_delete as lib_preview_delete},
+use imessage_database::tables::write::{
+    attachment_filter::AttachmentFilter, delete::preview_delete as lib_preview_delete,
 };
 use serde::Serialize;
 
@@ -31,11 +30,18 @@ pub struct BackupPreview {
 #[tauri::command]
 pub async fn preview_backup(filter: FilterSpec) -> Result<BackupPreview, AppError> {
     let path = default_chat_db_path()?;
-    let conn = get_connection(&path)?;
     let ctx = filter.to_query_context()?;
+    blocking(move || preview_blocking(&path, &ctx)).await
+}
+
+fn preview_blocking(
+    path: &std::path::Path,
+    ctx: &imessage_database::util::query_context::QueryContext,
+) -> Result<BackupPreview, AppError> {
+    let conn = open_read(path)?;
     let has_filters = ctx.has_filters();
 
-    let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &path)
+    let plan = lib_preview_delete(&conn, ctx, &AttachmentFilter::any(), path)
         .map_err(|e| AppError::Database(format!("failed to count messages: {e}")))?;
 
     let mut on_disk_count = 0u64;

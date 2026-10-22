@@ -3,7 +3,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use imessage_database::tables::table::{get_connection, get_writable_connection};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -12,11 +11,12 @@ use crate::core::attachment_files::{
     attachment_roots, expand_tilde, is_within_roots, path_key, remove_attachment_file, walk_files,
     RemoveOutcome,
 };
-use crate::core::db_path::default_chat_db_path;
+use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write};
 use crate::core::messages_app::is_messages_running;
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
-    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SNAPSHOTS_TO_KEEP,
+    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
+    SNAPSHOTS_TO_KEEP,
 };
 use crate::error::AppError;
 
@@ -232,9 +232,16 @@ fn find_orphans(
 
 #[tauri::command]
 pub async fn scan_orphans(app: AppHandle, include_retained: bool) -> Result<OrphanScan, AppError> {
-    let db_path = default_chat_db_path()?;
-    let conn = get_connection(&db_path)?;
     let store = RetainedAttachments::for_app(&app)?;
+    blocking(move || scan_orphans_blocking(&store, include_retained)).await
+}
+
+fn scan_orphans_blocking(
+    store: &RetainedAttachments,
+    include_retained: bool,
+) -> Result<OrphanScan, AppError> {
+    let db_path = default_chat_db_path()?;
+    let conn = open_read(&db_path)?;
     let retained = store.load()?;
     let orphans = find_orphans(
         &conn,
@@ -282,15 +289,24 @@ pub async fn clean_orphans(
     app: AppHandle,
     args: CleanOrphansArgs,
 ) -> Result<OrphanCleanResult, AppError> {
+    let store = RetainedAttachments::for_app(&app)?;
+    let snapshot_root = default_snapshot_root(&app, SnapshotKind::OrphanClean)?;
+    blocking(move || clean_orphans_blocking(&store, &snapshot_root, &args)).await
+}
+
+fn clean_orphans_blocking(
+    store: &RetainedAttachments,
+    snapshot_root: &Path,
+    args: &CleanOrphansArgs,
+) -> Result<OrphanCleanResult, AppError> {
     ensure_messages_not_running()?;
 
     let db_path = default_chat_db_path()?;
     let roots = attachment_roots();
-    let store = RetainedAttachments::for_app(&app)?;
     let retained = store.load()?;
 
     let orphans = {
-        let conn = get_connection(&db_path)?;
+        let conn = open_read(&db_path)?;
         find_orphans(
             &conn,
             &retained,
@@ -312,13 +328,12 @@ pub async fn clean_orphans(
     let mut snapshot_path = None;
     if !orphans.db.is_empty() {
         checkpoint_wal(&db_path)?;
-        let snapshot_root = default_snapshot_root(&app)?;
-        let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
-        prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
+        let snapshot = snapshot_chat_db(&db_path, snapshot_root)?;
+        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP);
         snapshot_path = Some(snapshot.dir.display().to_string());
 
         ensure_messages_not_running()?;
-        let mut conn = get_writable_connection(&db_path)?;
+        let mut conn = open_write(&db_path)?;
         let tx = conn.transaction()?;
         for o in &orphans.db {
             // Re-check the orphan condition inside the transaction so a row

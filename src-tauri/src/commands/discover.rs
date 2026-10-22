@@ -1,4 +1,4 @@
-use crate::core::db_path::default_chat_db_path;
+use crate::core::db_path::{blocking, check_chat_db_access, default_chat_db_path, open_read};
 use crate::error::AppError;
 use imessage_database::tables::{
     chat::Chat,
@@ -6,6 +6,7 @@ use imessage_database::tables::{
     table::{get_connection, Cacheable},
 };
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,21 +21,13 @@ pub struct ProbeResult {
 /// can't open it — the typical signal that the user hasn't granted FDA yet.
 #[tauri::command]
 pub async fn probe_db() -> Result<ProbeResult, AppError> {
+    blocking(probe_db_blocking).await
+}
+
+fn probe_db_blocking() -> Result<ProbeResult, AppError> {
     let path = default_chat_db_path()?;
-
     let path_str = path.display().to_string();
-
-    // See `check_fda`: `exists()` would report a TCC denial as "not found".
-    match std::fs::metadata(&path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(AppError::FullDiskAccess { path: path_str });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::Other(format!("chat.db not found at {path_str}")));
-        }
-        Err(e) => return Err(AppError::from(e)),
-    }
+    check_chat_db_access(&path)?;
 
     let conn = match get_connection(&path) {
         Ok(c) => c,
@@ -68,6 +61,51 @@ pub struct ChatSummary {
     pub participant_count: usize,
     pub participant_handles: Vec<String>,
     pub message_count: i64,
+    /// Every chat row that makes up this conversation. Messages often keeps
+    /// separate rows for the same conversation (iMessage vs SMS/RCS, or
+    /// after re-registration); filtering by just one would back up or
+    /// delete only part of the history.
+    pub chat_ids: Vec<i32>,
+}
+
+/// Fold chat rows that share a `chat_identifier` (case-insensitively) into
+/// one conversation. The row with the most messages provides the `rowid`
+/// and labels; counts, participants and services are combined.
+pub(crate) fn merge_chats(rows: Vec<ChatSummary>) -> Vec<ChatSummary> {
+    let mut sorted = rows;
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.message_count));
+
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<ChatSummary> = Vec::new();
+    for row in sorted {
+        let key = row.chat_identifier.to_lowercase();
+        let Some(&i) = by_key.get(&key).filter(|_| !key.is_empty()) else {
+            by_key.insert(key, out.len());
+            out.push(row);
+            continue;
+        };
+        let merged = &mut out[i];
+        merged.chat_ids.extend(row.chat_ids);
+        merged.message_count += row.message_count;
+        merged.display_name = merged.display_name.take().or(row.display_name);
+        merged.contact_name = merged.contact_name.take().or(row.contact_name);
+        merged.service_name = match (merged.service_name.take(), row.service_name) {
+            (Some(a), Some(b)) if !a.split(", ").any(|s| s == b) => Some(format!("{a}, {b}")),
+            (a, b) => a.or(b),
+        };
+        merged.participant_handles.extend(row.participant_handles);
+        merged.participant_handles.sort();
+        merged.participant_handles.dedup();
+        merged.participant_count = merged
+            .participant_count
+            .max(row.participant_count)
+            .max(merged.participant_handles.len());
+    }
+    for c in &mut out {
+        c.chat_ids.sort_unstable();
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.message_count));
+    out
 }
 
 /// List all conversations in chat.db, sorted by message count (descending) so
@@ -80,9 +118,17 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
     let contact_map = tokio::task::spawn_blocking(crate::core::contacts::fetch_contact_map)
         .await
         .map_err(|e| AppError::Other(format!("contact lookup task failed: {e}")))?;
+    #[cfg(not(target_os = "macos"))]
+    let contact_map = crate::core::contacts::ContactMap::default();
 
+    blocking(move || list_chats_blocking(&contact_map)).await
+}
+
+fn list_chats_blocking(
+    contact_map: &crate::core::contacts::ContactMap,
+) -> Result<Vec<ChatSummary>, AppError> {
     let path = default_chat_db_path()?;
-    let conn = get_connection(&path)?;
+    let conn = open_read(&path)?;
 
     let chats = Chat::cache(&conn)?;
 
@@ -142,13 +188,10 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
         }
     }
 
-    let mut summaries: Vec<ChatSummary> = chats
+    let summaries: Vec<ChatSummary> = chats
         .into_iter()
         .map(|(rowid, c)| {
-            #[cfg(target_os = "macos")]
             let contact_name = contact_map.lookup(&c.chat_identifier);
-            #[cfg(not(target_os = "macos"))]
-            let contact_name: Option<String> = None;
 
             ChatSummary {
                 rowid,
@@ -159,12 +202,12 @@ pub async fn list_chats() -> Result<Vec<ChatSummary>, AppError> {
                 participant_count: participant_counts.get(&rowid).copied().unwrap_or(0),
                 participant_handles: participant_handles.remove(&rowid).unwrap_or_default(),
                 message_count: message_counts.get(&rowid).copied().unwrap_or(0),
+                chat_ids: vec![rowid],
             }
         })
         .collect();
 
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.message_count));
-    Ok(summaries)
+    Ok(merge_chats(summaries))
 }
 
 #[derive(Debug, Serialize)]
@@ -181,8 +224,12 @@ pub struct ContactSummary {
 /// given contact and the library will resolve the full group.
 #[tauri::command]
 pub async fn list_contacts() -> Result<Vec<ContactSummary>, AppError> {
+    blocking(list_contacts_blocking).await
+}
+
+fn list_contacts_blocking() -> Result<Vec<ContactSummary>, AppError> {
     let path = default_chat_db_path()?;
-    let conn = get_connection(&path)?;
+    let conn = open_read(&path)?;
 
     let handles = Handle::cache(&conn)?;
     let mut contacts: Vec<ContactSummary> = handles
@@ -193,4 +240,46 @@ pub async fn list_contacts() -> Result<Vec<ContactSummary>, AppError> {
 
     contacts.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(contacts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat(rowid: i32, id: &str, service: &str, count: i64, handles: &[&str]) -> ChatSummary {
+        ChatSummary {
+            rowid,
+            chat_identifier: id.into(),
+            display_name: None,
+            contact_name: None,
+            service_name: Some(service.into()),
+            participant_count: handles.len(),
+            participant_handles: handles.iter().map(|h| h.to_string()).collect(),
+            message_count: count,
+            chat_ids: vec![rowid],
+        }
+    }
+
+    #[test]
+    fn merges_rows_for_the_same_conversation() {
+        let merged = merge_chats(vec![
+            chat(1, "+15551234567", "SMS", 10, &["+15551234567"]),
+            chat(
+                2,
+                "other@example.com",
+                "iMessage",
+                5,
+                &["other@example.com"],
+            ),
+            chat(3, "+15551234567", "iMessage", 40, &["+15551234567"]),
+        ]);
+        assert_eq!(merged.len(), 2);
+        let first = &merged[0];
+        assert_eq!(first.rowid, 3, "row with most messages is the primary");
+        assert_eq!(first.chat_ids, vec![1, 3]);
+        assert_eq!(first.message_count, 50);
+        assert_eq!(first.service_name.as_deref(), Some("iMessage, SMS"));
+        assert_eq!(first.participant_handles, vec!["+15551234567"]);
+        assert_eq!(merged[1].chat_ids, vec![2]);
+    }
 }

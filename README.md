@@ -52,7 +52,7 @@ The single-page UI walks through five numbered cards in sequence:
 
 3. **Preview** — live preview (400 ms debounce) of how many messages and attachments match the current filters, with breakdown of on-disk vs. not-on-this-Mac (iCloud metadata without local content) vs. missing.
 
-4. **Backup** — format selector (JSON / HTML / PDF / TXT), folder picker, attachments toggle. Progress is driven by real-time events from the Rust side. Result shows message count, conversation count, attachments copied, total bytes, and manifest path.
+4. **Backup** — format selector (JSON / HTML / PDF / TXT), folder picker (home folder or an external drive), attachments toggle. Each run writes into a new `Bubble Wrap <timestamp>` subfolder; copied attachments are named `<rowid>-<original name>` so same-named files (e.g. every `Audio Message.caf`) never collide. Progress is driven by real-time events from the Rust side. Result shows message count, conversation count, per-attachment copy outcomes (copied / not on this Mac / failed), and the output path.
 
 5. **Delete** (opt-in, behind a toggle) — shows Messages.app running status and iCloud sync warning. Scope selector: delete messages + attachments, messages only, or attachments only. Requires typed confirmation before executing.
 
@@ -67,7 +67,7 @@ A **File > Clean Orphaned Data…** menu item opens a modal that scans for and r
 3. `pgrep -x Messages` must return empty (Messages.app must be closed)
 4. If Messages-in-iCloud is detected as **Enabled**, `acknowledge_icloud_sync=true` is required
 5. `PRAGMA wal_checkpoint(TRUNCATE)` flushes the WAL on the source DB
-6. Atomic snapshot of `chat.db` via SQLite's online backup API written to `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/<ISO-timestamp>/` (the 5 most recent are kept)
+6. Atomic snapshot of `chat.db` via SQLite's online backup API written to `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/delete/<ISO-timestamp>/` (orphan cleanups use `snapshots/orphan-clean/`; the 5 most recent of each are kept)
 7. Delete plan built on a read-only connection, then applied on a separate writable connection
 8. Writable connection released immediately after commit
 9. Attachment files unlinked after the SQL transaction; failures are logged to stderr with path + reason but are non-fatal
