@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use imessage_database::util::query_context::QueryContext;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Deserialize, Default)]
@@ -35,7 +35,7 @@ pub struct AttachmentFilterSpec {
 /// earlier in the session covers exactly the records a delete will remove.
 /// Empty strings and empty id lists are folded to `None`, matching how
 /// `to_query_context` (and the library's `QueryContext`) treat them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterKey {
     start: Option<String>,
     end: Option<String>,

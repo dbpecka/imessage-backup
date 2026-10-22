@@ -8,6 +8,20 @@ use serde::Serialize;
 pub struct SafetyStatus {
     pub messages_running: bool,
     pub icloud_messages: ICloudState,
+    /// Where earlier builds kept full copies of chat.db (under
+    /// `~/Documents`, which may sync to iCloud Drive), if any are still
+    /// there. Shown so the user can remove them; never deleted for them.
+    pub legacy_snapshot_dir: Option<String>,
+}
+
+fn legacy_snapshot_dir() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::Path::new(&home).join("Documents/iMessage Backups/snapshots");
+    std::fs::read_dir(&dir)
+        .ok()?
+        .next()
+        .is_some()
+        .then(|| dir.display().to_string())
 }
 
 /// Collect the safety signals the frontend needs to decide whether to allow
@@ -22,5 +36,6 @@ pub async fn safety_status() -> Result<SafetyStatus, AppError> {
     Ok(SafetyStatus {
         messages_running,
         icloud_messages,
+        legacy_snapshot_dir: legacy_snapshot_dir(),
     })
 }

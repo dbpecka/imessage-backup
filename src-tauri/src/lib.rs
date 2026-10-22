@@ -11,9 +11,17 @@ use tauri::Emitter;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        .manage(core::receipts::BackupReceipts::default())
+        .manage(core::op_lock::OperationLock::default())
         .setup(|app| {
+            use tauri::Manager;
+            let receipts = match app.path().app_data_dir() {
+                Ok(dir) => {
+                    core::receipts::BackupReceipts::persistent(dir.join("backup_receipts.json"))
+                }
+                Err(_) => core::receipts::BackupReceipts::default(),
+            };
+            app.manage(receipts);
+
             let clean_item =
                 MenuItemBuilder::with_id("clean-orphans", "Clean Orphaned Data…").build(app)?;
 

@@ -76,3 +76,28 @@ remove `public/.idea/` from the repo.
 Committed files that shouldn't be: `errors.txt`, `.idea/`, `public/.idea/`,
 `BubbleWrap.xcodeproj/project.xcworkspace/xcuserdata/`. Remove them and add
 to `.gitignore` so local paths/usernames and dev logs don't leak.
+
+## 6. Backups and snapshots are unencrypted
+
+Every backup (and every `chat.db` snapshot) is a plain copy of the user's
+whole message history and attachments. Backups can go to external drives
+(often exFAT, with no file permissions) or to folders that sync to iCloud
+Drive.
+
+**Done so far:** the backup step says backups aren't encrypted, and warns
+more strongly for `/Volumes/…`, iCloud Drive, and Desktop/Documents
+destinations. Snapshots live in `~/Library/Application Support/<app>/`
+(not synced). The delete panel points out leftover snapshots from earlier
+builds in `~/Documents/iMessage Backups/snapshots` (never deleted
+automatically).
+
+**Still to do:** offer encrypted backups (e.g. an encrypted APFS sparse
+bundle via `hdiutil create -encryption AES-256`, or an encrypted archive),
+and consider encrypting snapshots at rest or deleting them after a
+configurable period.
+
+## 7. Removed: unused shell plugin
+
+`tauri-plugin-shell` and the `shell:allow-open` capability were registered
+but never used by the frontend; both have been removed to shrink the attack
+surface. Don't re-add them without a concrete need and a scoped permission.

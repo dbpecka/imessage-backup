@@ -18,6 +18,7 @@ use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write
 use crate::core::filter::FilterSpec;
 use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
+use crate::core::op_lock::OperationLock;
 use crate::core::receipts::BackupReceipts;
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
@@ -142,9 +143,9 @@ fn is_missing_column(e: &rusqlite::Error) -> bool {
 pub(crate) fn add_orphaned_reactions(
     conn: &Connection,
     plan: &mut DeletePlan,
-) -> Result<(), AppError> {
+) -> Result<u64, AppError> {
     if plan.message_rowids.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut guids: HashSet<String> = HashSet::new();
     for chunk in plan.message_rowids.chunks(800) {
@@ -166,20 +167,72 @@ pub(crate) fn add_orphaned_reactions(
     let mut stmt = match stmt {
         Ok(s) => s,
         // Very old (or test) schemas don't track reactions this way.
-        Err(e) if is_missing_column(&e) => return Ok(()),
+        Err(e) if is_missing_column(&e) => return Ok(0),
         Err(e) => return Err(e.into()),
     };
     let planned: HashSet<i64> = plan.message_rowids.iter().copied().collect();
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut added = 0u64;
     for row in rows {
         let (rowid, associated) = row?;
         if !planned.contains(&rowid) && guids.contains(reaction_target(&associated)) {
             plan.message_rowids.push(rowid);
+            added += 1;
         }
     }
     plan.message_rowids.sort_unstable();
     plan.message_rowids.dedup();
-    Ok(())
+    Ok(added)
+}
+
+/// Messages linked to any of `attachment_ids`.
+fn messages_linked_to(conn: &Connection, attachment_ids: &[i64]) -> Result<Vec<i64>, AppError> {
+    let mut out = Vec::new();
+    for chunk in attachment_ids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT message_id FROM message_attachment_join \
+             WHERE attachment_id IN ({placeholders})"
+        ))?;
+        for id in stmt.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))? {
+            out.push(id?);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// After an attachments-only delete, messages that no longer have any
+/// attachment still carry `cache_has_attachments = 1`, which makes Messages
+/// and exporters look for attachments that are gone. Best-effort: runs in
+/// its own transaction after the delete committed, and a failure only means
+/// the flag stays stale.
+pub(crate) fn clear_stale_attachment_flags(
+    conn: &mut Connection,
+    message_ids: &[i64],
+) -> Result<u64, AppError> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let mut updated = 0u64;
+    for chunk in message_ids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "UPDATE message SET cache_has_attachments = 0 \
+             WHERE ROWID IN ({placeholders}) \
+               AND NOT EXISTS (SELECT 1 FROM message_attachment_join j \
+                               WHERE j.message_id = message.ROWID)"
+        );
+        match tx.execute(&sql, params_from_iter(chunk.iter())) {
+            Ok(n) => updated += n as u64,
+            Err(e) if is_missing_column(&e) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    tx.commit()?;
+    Ok(updated)
 }
 
 /// Planned attachments whose file isn't on this Mac (typically offloaded to
@@ -207,16 +260,18 @@ pub(crate) fn count_not_on_mac(conn: &Connection, plan: &DeletePlan) -> Result<u
 
 /// The full (unscoped) plan for `ctx`, shared by the preview and the delete
 /// so the counts the user confirms are the counts that get deleted.
+/// Also returns how many tapbacks outside the filter were added because
+/// their target message is being deleted.
 pub(crate) fn build_plan(
     conn: &Connection,
     ctx: &QueryContext,
     db_path: &std::path::Path,
-) -> Result<DeletePlan, AppError> {
+) -> Result<(DeletePlan, u64), AppError> {
     let mut plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
         .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
-    add_orphaned_reactions(conn, &mut plan)?;
+    let reactions = add_orphaned_reactions(conn, &mut plan)?;
     exclude_shared_attachments(conn, &mut plan)?;
-    Ok(plan)
+    Ok((plan, reactions))
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +283,9 @@ pub struct DeletePreview {
     pub on_disk_file_count: u64,
     /// Matched attachments whose file isn't on this Mac.
     pub not_on_mac_count: u64,
+    /// Of `message_count`: tapbacks outside the filter whose target message
+    /// is being deleted (so they'd otherwise point at nothing).
+    pub reaction_count: u64,
 }
 
 /// Compute what a delete with the given filter would remove. Read-only.
@@ -237,8 +295,9 @@ pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppErro
     let ctx = filter.to_query_context()?;
     blocking(move || {
         let conn = open_read(&db_path)?;
-        let plan = build_plan(&conn, &ctx, &db_path)?;
+        let (plan, reaction_count) = build_plan(&conn, &ctx, &db_path)?;
         Ok(DeletePreview {
+            reaction_count,
             message_count: plan.message_rowids.len() as u64,
             attachment_count: plan.attachment_rowids.len() as u64,
             attachment_bytes: plan.attachment_bytes,
@@ -383,8 +442,11 @@ fn ensure_messages_not_running() -> Result<(), AppError> {
 pub async fn run_delete(
     app: AppHandle,
     receipts: State<'_, BackupReceipts>,
+    lock: State<'_, OperationLock>,
     args: RunDeleteArgs,
 ) -> Result<DeleteResult, AppError> {
+    let _guard = lock.try_acquire("a delete")?;
+
     // Gate 1: typed confirmation.
     if args.confirmation_phrase != DELETE_CONFIRMATION_PHRASE {
         return Err(AppError::Other(format!(
@@ -439,7 +501,7 @@ pub async fn run_delete(
         // though we'll execute it against a writable one, there's no reason
         // to hold two writers, and the read-only path is more conservative.
         let read_conn = open_read(&db_path)?;
-        let mut plan = build_plan(&read_conn, &ctx, &db_path)?;
+        let (mut plan, _) = build_plan(&read_conn, &ctx, &db_path)?;
 
         // A messages-only delete also drops the message_attachment_join
         // rows, leaving the kept attachments unlinked; the orphan cleaner
@@ -462,6 +524,11 @@ pub async fn run_delete(
         // Gate 3a: attachments that exist only in iCloud can't be backed up
         // and become unrecoverable once their records are gone.
         let not_on_mac = count_not_on_mac(&read_conn, &plan)?;
+        let flag_candidates = if matches!(args.delete_scope, DeleteScope::AttachmentsOnly) {
+            messages_linked_to(&read_conn, &plan.attachment_rowids)?
+        } else {
+            Vec::new()
+        };
         drop(read_conn);
         if not_on_mac > 0 && !args.acknowledge_not_on_mac {
             return Err(AppError::Other(format!(
@@ -502,6 +569,9 @@ pub async fn run_delete(
                 )));
             }
         };
+        if let Err(e) = clear_stale_attachment_flags(&mut write_conn, &flag_candidates) {
+            eprintln!("delete: couldn't clear attachment flags on kept messages: {e:?}");
+        }
         // Release the writable handle immediately so Messages.app can
         // reopen.
         drop(write_conn);
@@ -706,13 +776,14 @@ mod tests {
         assert!(!gate(DeleteScope::Both, true).unwrap());
 
         // A references-only backup covers a messages-only delete…
-        receipts.record(filter.key(), false);
+        let backup_dir = tempfile::TempDir::new().unwrap();
+        receipts.record(filter.key(), false, backup_dir.path());
         assert!(gate(DeleteScope::MessagesOnly, false).unwrap());
         // …but not one that unlinks attachment files.
         let err = gate(DeleteScope::AttachmentsOnly, false).unwrap_err();
         assert!(matches!(err, AppError::Other(m) if m.contains("didn't copy attachment")));
 
-        receipts.record(filter.key(), true);
+        receipts.record(filter.key(), true, backup_dir.path());
         assert!(gate(DeleteScope::Both, false).unwrap());
 
         // A backup for a different filter doesn't count.
@@ -767,6 +838,43 @@ mod tests {
     }
 
     #[test]
+    fn attachments_only_delete_clears_stale_flags() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE message ADD COLUMN cache_has_attachments INTEGER DEFAULT 0;
+             UPDATE message SET cache_has_attachments = 1 WHERE ROWID = 2;
+             -- Message 1 has two attachments; only one is deleted.
+             INSERT INTO attachment (ROWID, filename) VALUES (2, '/x/a'), (3, '/x/b');
+             INSERT INTO message_attachment_join VALUES (1, 2), (1, 3);
+             UPDATE message SET cache_has_attachments = 1 WHERE ROWID = 1;",
+        )
+        .unwrap();
+        let plan = DeletePlan {
+            attachment_rowids: vec![1, 2],
+            ..Default::default()
+        };
+        let candidates = messages_linked_to(&conn, &plan.attachment_rowids).unwrap();
+        assert_eq!(candidates, vec![1, 2]);
+        execute_delete(&mut conn, &plan).unwrap();
+
+        assert_eq!(
+            clear_stale_attachment_flags(&mut conn, &candidates).unwrap(),
+            1
+        );
+        let flag = |id: i64| -> i64 {
+            conn.query_row(
+                "SELECT cache_has_attachments FROM message WHERE ROWID = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(flag(2), 0, "lost its only attachment");
+        assert_eq!(flag(1), 1, "still has attachment 3");
+    }
+
+    #[test]
     fn reaction_targets_are_parsed() {
         assert_eq!(reaction_target("p:0/ABC-123"), "ABC-123");
         assert_eq!(reaction_target("p:12/ABC"), "ABC");
@@ -802,15 +910,16 @@ mod tests {
 
         let mut ctx = QueryContext::default();
         ctx.set_selected_chat_ids(std::collections::BTreeSet::from([1]));
-        let plan = build_plan(&conn, &ctx, &db_path).unwrap();
+        let (plan, reactions) = build_plan(&conn, &ctx, &db_path).unwrap();
         assert_eq!(plan.message_rowids, vec![1, 2, 10]);
+        assert_eq!(reactions, 1);
     }
 
     #[test]
     fn reactions_are_skipped_on_schemas_without_them() {
         let (_tmp, db_path, _att) = fresh_fixture();
         let conn = Connection::open(&db_path).unwrap();
-        let plan = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        let (plan, _) = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
         assert_eq!(plan.message_rowids, vec![1, 2]);
     }
 
@@ -823,7 +932,7 @@ mod tests {
              INSERT INTO message_attachment_join VALUES (1, 2), (1, 3);",
         )
         .unwrap();
-        let plan = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        let (plan, _) = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
         // Row 1's file exists, row 2's doesn't, row 3 has no file at all.
         assert_eq!(count_not_on_mac(&conn, &plan).unwrap(), 1);
     }

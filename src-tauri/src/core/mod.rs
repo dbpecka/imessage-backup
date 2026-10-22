@@ -8,6 +8,7 @@ pub mod db_path;
 pub mod filter;
 pub mod icloud;
 pub mod messages_app;
+pub mod op_lock;
 pub mod paths;
 pub mod progress;
 pub mod receipts;

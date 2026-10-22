@@ -93,11 +93,27 @@ pub fn remove_attachment_file(path: &Path, roots: &[PathBuf], context: &str) -> 
         return RemoveOutcome::Refused;
     }
     match fs::remove_file(path) {
-        Ok(()) => RemoveOutcome::Removed,
+        Ok(()) => {
+            remove_empty_parents(path, roots);
+            RemoveOutcome::Removed
+        }
         Err(e) => {
             eprintln!("{context}: failed to remove {}: {e}", path.display());
             RemoveOutcome::Failed
         }
+    }
+}
+
+/// After unlinking `path`, remove the folders it leaves empty, walking up
+/// to (but never including) the attachment root. `remove_dir` refuses
+/// non-empty folders, so this can only ever remove empty ones.
+fn remove_empty_parents(path: &Path, roots: &[PathBuf]) {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if !is_within_roots(d, roots) || fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
     }
 }
 
@@ -168,6 +184,31 @@ mod tests {
             remove_attachment_file(&inside, &roots, "test"),
             RemoveOutcome::Missing
         );
+    }
+
+    #[test]
+    fn removing_last_file_prunes_empty_folders_but_not_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("Attachments");
+        let roots = vec![root.clone()];
+        let a = root.join("ab/01/GUID-1/a.jpg");
+        let b1 = root.join("ab/02/GUID-2/b.jpg");
+        let b2 = root.join("ab/02/GUID-2/b.mov");
+        for f in [&a, &b1, &b2] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, b"x").unwrap();
+        }
+
+        remove_attachment_file(&a, &roots, "test");
+        assert!(!root.join("ab/01").exists(), "emptied folders are removed");
+        assert!(root.join("ab").exists(), "non-empty parent stays");
+
+        remove_attachment_file(&b1, &roots, "test");
+        assert!(b2.exists() && root.join("ab/02/GUID-2").exists());
+
+        remove_attachment_file(&b2, &roots, "test");
+        assert!(root.exists(), "the root itself is never removed");
+        assert!(!root.join("ab").exists());
     }
 
     #[cfg(unix)]

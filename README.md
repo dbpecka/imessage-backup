@@ -163,3 +163,20 @@ src-tauri/
     src/exporters/         — html, txt, json, pdf export engines
     src/tables/write/      — delete.rs (two-phase plan + execute), orphans.rs
 ```
+
+---
+
+## Restoring from a snapshot
+
+Every delete and orphan cleanup first saves a copy of `chat.db` to
+`~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/<delete|orphan-clean>/<timestamp>/`.
+To roll back:
+
+1. Quit Messages (and make sure it stays quit).
+2. Replace `~/Library/Messages/chat.db` with the snapshot's `chat.db`.
+3. Delete `chat.db-wal` and `chat.db-shm` next to it in `~/Library/Messages/`.
+4. Reopen Messages.
+
+Snapshots only contain the database. Attachment files removed by a delete
+are not in the snapshot — restore them from your backup's `attachments/`
+folder. Backups and snapshots are not encrypted.

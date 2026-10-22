@@ -196,6 +196,17 @@ pub fn copy_attachments(
         }
         match fs::copy(&src, &dest) {
             Ok(n) if n == meta.len() => {
+                // Keep the original date so the archive sorts by when the
+                // attachment was received, not when it was backed up.
+                if let Ok(modified) = meta.modified() {
+                    let set = fs::File::options()
+                        .write(true)
+                        .open(&dest)
+                        .and_then(|f| f.set_modified(modified));
+                    if let Err(e) = set {
+                        eprintln!("backup: couldn't keep date on {}: {e}", dest.display());
+                    }
+                }
                 summary.copied += 1;
                 summary.bytes += n;
                 copied.insert(attachment.rowid, rel);
@@ -215,6 +226,44 @@ pub fn copy_attachments(
     Ok((summary, copied))
 }
 
+/// Sizes of what the runtime wrote, keyed by file stem (the rowid):
+/// `attachments/<chat>/<rowid>[.<ext>]` — a file, or a folder for
+/// bundle-type attachments.
+fn runtime_copy_sizes(export_path: &Path) -> HashMap<String, u64> {
+    let mut by_stem: HashMap<String, u64> = HashMap::new();
+    if let Ok(chats) = fs::read_dir(export_path.join(ATTACHMENTS_DIR)) {
+        for chat in chats.flatten() {
+            if !chat.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(chat.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let len = match entry.file_type() {
+                    Ok(t) if t.is_file() => fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                    Ok(t) if t.is_dir() => {
+                        let mut files = Vec::new();
+                        walk_files(&path, &mut files);
+                        files
+                            .iter()
+                            .map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+                            .sum()
+                    }
+                    _ => continue,
+                };
+                *by_stem.entry(stem.to_string()).or_default() += len;
+            }
+        }
+    }
+
+    by_stem
+}
+
 /// The HTML/TXT runtime does its own copying (to
 /// `attachments/<chat>/<rowid>.<ext>`, possibly converted) but only logs
 /// failures. Work out what actually landed in the export so the result is
@@ -225,15 +274,7 @@ pub fn verify_runtime_copies(
     query: &QueryContext,
     export_path: &Path,
 ) -> Result<CopySummary, AppError> {
-    let mut by_stem: HashMap<String, u64> = HashMap::new();
-    let mut files = Vec::new();
-    walk_files(&export_path.join(ATTACHMENTS_DIR), &mut files);
-    for f in files {
-        if let Some(stem) = f.file_stem().and_then(|s| s.to_str()) {
-            let len = fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
-            *by_stem.entry(stem.to_string()).or_default() += len;
-        }
-    }
+    let by_stem = runtime_copy_sizes(export_path);
 
     let mut summary = CopySummary::default();
     for_each_attachment(conn, db_path, query, |_, attachment, src| {
@@ -383,6 +424,19 @@ mod tests {
             copy_file_name(&att(5, None), src),
             "5-IMG_1.pluginPayloadAttachment"
         );
+    }
+
+    #[test]
+    fn runtime_copies_are_found_as_files_or_folders() {
+        let tmp = TempDir::new().unwrap();
+        let chat = tmp.path().join("attachments/7");
+        fs::create_dir_all(chat.join("12")).unwrap();
+        fs::write(chat.join("12/inner.bin"), b"abcd").unwrap();
+        fs::write(chat.join("11.jpeg"), b"xy").unwrap();
+
+        let stems = runtime_copy_sizes(tmp.path());
+        assert_eq!(stems.get("11"), Some(&2));
+        assert_eq!(stems.get("12"), Some(&4));
     }
 
     #[test]
