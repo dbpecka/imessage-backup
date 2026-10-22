@@ -1,5 +1,6 @@
 use imessage_database::{
     exporters::{
+        compatibility::attachment_manager::AttachmentManagerMode,
         config::{AttachmentMode, ExportConfig},
         export_type::ExportType,
         json::run_json_export,
@@ -13,6 +14,7 @@ use imessage_database::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
+use crate::commands::delete::filter_content;
 use crate::core::attachment_copy::{
     annotate_json_export, copy_attachments, verify_runtime_copies, CopySummary,
 };
@@ -85,7 +87,15 @@ pub async fn run_backup(
     let progress = TauriProgress::new(app.clone(), BACKUP_PROGRESS_EVENT);
     let format_label = format.to_string();
 
-    let result = blocking(move || -> Result<BackupResult, AppError> {
+    let (result, content) = blocking(move || -> Result<_, AppError> {
+        // Fingerprint what the filter matches *before* exporting. Anything
+        // that arrives during or after the run changes the fingerprint, so
+        // this backup can never vouch for messages it might not contain.
+        let content = {
+            let conn = open_read(&db_path)?;
+            filter_content(&conn, &query, &db_path)?.1
+        };
+
         // Every run gets its own folder: the JSON exporter appends to
         // existing files (re-running into the same folder duplicated every
         // message), and stale files from an earlier run must never be
@@ -170,7 +180,15 @@ pub async fn run_backup(
                     } else {
                         AttachmentMode::Reference
                     };
-                    let options: Options = config(mode).into();
+                    let mut options: Options = config(mode).into();
+                    if copy {
+                        // The library's default copy mode re-encodes HEIC
+                        // photos (and stickers) as JPEG via `sips`. A backup
+                        // must hold the originals: a delete removes them
+                        // from the Mac. Browsers may not show HEIC inline in
+                        // the HTML, but the files are byte-for-byte intact.
+                        options.attachment_manager.mode = AttachmentManagerMode::Clone;
+                    }
                     let mut runtime = Config::new(options).map_err(|e| {
                         AppError::Other(format!("failed to initialise export runtime: {e}"))
                     })?;
@@ -201,7 +219,7 @@ pub async fn run_backup(
                 }
             };
 
-        Ok(BackupResult {
+        let result = BackupResult {
             message_count,
             attachment_count,
             attachment_bytes_copied: copy_summary.as_ref().map_or(0, |c| c.bytes),
@@ -211,7 +229,8 @@ pub async fn run_backup(
             format: format_label,
             includes_attachments: copy_summary.as_ref().is_some_and(|c| c.failed == 0),
             attachment_copy: copy_summary,
-        })
+        };
+        Ok((result, content))
     })
     .await?;
 
@@ -220,6 +239,7 @@ pub async fn run_backup(
     // could be made was made.
     receipts.record(
         filter_key,
+        content,
         result.includes_attachments,
         std::path::Path::new(&result.export_path),
     );

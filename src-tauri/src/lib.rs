@@ -77,6 +77,7 @@ pub fn run() {
             commands::backup::run_backup,
             commands::delete::preview_delete,
             commands::delete::run_delete,
+            commands::delete::backup_coverage,
             commands::safety::safety_status,
             commands::orphans::scan_orphans,
             commands::orphans::clean_orphans,

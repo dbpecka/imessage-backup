@@ -15,6 +15,7 @@
     type SafetyStatus,
     type DeletePreview,
     type DeleteResult,
+    type BackupCoverage,
     type DeleteScope,
     type OrphanScan,
     type OrphanCleanResult,
@@ -192,6 +193,10 @@
   // Filter the current `deletePreview` was computed for. A preview only
   // counts as current when this matches the live filter.
   let deletePreviewFilterKey = $state('');
+  // Backend's view of whether a backup (from this or an earlier session)
+  // covers exactly what the filter matches now. Fetched with the preview so
+  // both describe the same filter.
+  let coverage = $state<BackupCoverage | null>(null);
   let deletePreviewTimer: ReturnType<typeof setTimeout> | undefined;
   let deleteMessages = $state(true);
   let deleteAttachments = $state(true);
@@ -470,6 +475,8 @@
     } finally {
       running = false;
     }
+    // Refresh what the delete step knows about backups.
+    if (deleteExpanded && status === 'ok' && !dateFilterError) await runDeletePreview();
   }
 
   let checkingSafety = $state(false);
@@ -505,15 +512,20 @@
     deleteError = '';
     const filter = buildFilter();
     try {
-      const result = await api.previewDelete(filter);
+      const [result, cov] = await Promise.all([
+        api.previewDelete(filter),
+        api.backupCoverage(filter)
+      ]);
       if (seq === deletePreviewSeq) {
         deletePreview = result;
+        coverage = cov;
         deletePreviewFilterKey = JSON.stringify(filter);
       }
     } catch (err) {
       if (seq === deletePreviewSeq) {
         deleteError = appErrorMessage(err);
         deletePreview = null;
+        coverage = null;
         deletePreviewFilterKey = '';
       }
     } finally {
@@ -533,6 +545,7 @@
       // Don't show (or keep) counts for a filter we can't apply.
       clearTimeout(deletePreviewTimer);
       deletePreview = null;
+      coverage = null;
       deletePreviewFilterKey = '';
       return;
     }
@@ -656,7 +669,9 @@
   // A backup only protects attachment files if it copied them: the safety
   // snapshot taken before a delete covers chat.db, not files on disk.
   const backupCoversDelete = $derived(
-    runResult !== null && (!deleteAttachments || runResult.includesAttachments)
+    coverage !== null &&
+      coverage.covered &&
+      (!deleteAttachments || coverage.withAttachments)
   );
 
   // Attachment records whose files only exist in iCloud: no backup can
@@ -1201,14 +1216,21 @@
           </label>
         {/if}
 
+        {#if backupCoversDelete && coverage?.exportPath}
+          <p class="meta">Backed up in <code>{coverage.exportPath}</code>.</p>
+        {/if}
         {#if !backupCoversDelete}
           <p class="meta">
-            {#if runResult?.attachmentCopy && runResult.attachmentCopy.failed > 0}
+            {#if coverage?.covered && runResult?.attachmentCopy && runResult.attachmentCopy.failed > 0}
               Some attachments failed to copy during your backup, so it doesn't protect them. Fix
               the errors listed in Step 4 and re-run the backup, or delete without that protection.
+            {:else if coverage?.covered}
+              Your backup of these messages didn't copy every attachment file. Deleted attachments
+              can't be restored from the safety snapshot — re-run the backup (Step 4) with
+              attachments copied.
             {:else if runResult}
-              Your backup didn't copy attachment files. Deleted attachments can't be restored from
-              the safety snapshot — re-run the backup (Step 4) with attachments copied.
+              These messages have changed since your backup (new messages may have arrived), so it
+              no longer covers everything this delete would remove. Re-run the backup (Step 4).
             {:else}
               Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
               you're about to remove.

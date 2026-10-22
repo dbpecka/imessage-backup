@@ -20,9 +20,62 @@ pub struct BackupReceipts {
     path: Option<PathBuf>,
 }
 
+/// Identifies exactly which messages and attachments a filter matched at a
+/// point in time. A filter alone isn't enough: with no end date (or a
+/// chats-only filter) the same filter matches new messages that arrived
+/// after the backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentFingerprint {
+    pub messages: u64,
+    pub attachments: u64,
+    pub hash: u64,
+}
+
+impl ContentFingerprint {
+    pub fn of(message_rowids: &[i64], attachment_rowids: &[i64]) -> Self {
+        // FNV-1a: stable across runs and Rust versions, unlike
+        // `DefaultHasher`, which matters because receipts are persisted.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for ids in [message_rowids, attachment_rowids] {
+            let mut sorted = ids.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            for id in sorted {
+                feed(&id.to_le_bytes());
+            }
+            feed(b"|");
+        }
+        Self {
+            messages: message_rowids.len() as u64,
+            attachments: attachment_rowids.len() as u64,
+            hash,
+        }
+    }
+}
+
+/// Whether completed backups cover a given filter's current content.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Coverage {
+    /// A backup of exactly these messages exists and its folder is still there.
+    pub covered: bool,
+    /// …and it copied every attachment file.
+    pub with_attachments: bool,
+    /// The covering backup's folder (the one with attachments, if any).
+    pub export_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Receipt {
     filter: FilterKey,
+    /// What the filter matched when the backup started.
+    content: ContentFingerprint,
     includes_attachments: bool,
     /// The run's output folder. A receipt only counts while this still
     /// exists — a deleted backup protects nothing.
@@ -44,10 +97,17 @@ impl BackupReceipts {
         }
     }
 
-    pub fn record(&self, filter: FilterKey, includes_attachments: bool, export_path: &Path) {
+    pub fn record(
+        &self,
+        filter: FilterKey,
+        content: ContentFingerprint,
+        includes_attachments: bool,
+        export_path: &Path,
+    ) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.push(Receipt {
             filter,
+            content,
             includes_attachments,
             export_path: export_path.to_path_buf(),
         });
@@ -60,16 +120,26 @@ impl BackupReceipts {
         }
     }
 
-    /// `true` if a successful backup with exactly this filter ran, its
-    /// output still exists, and — when `needs_attachments` — it copied
-    /// every attachment file.
-    pub fn covers(&self, filter: &FilterKey, needs_attachments: bool) -> bool {
+    /// Whether a successful backup with this filter, of exactly this
+    /// content, still exists on disk.
+    pub fn coverage(&self, filter: &FilterKey, content: &ContentFingerprint) -> Coverage {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.iter().any(|r| {
-            &r.filter == filter
-                && (r.includes_attachments || !needs_attachments)
-                && r.export_path.is_dir()
-        })
+        let matching = || {
+            g.iter()
+                .rev()
+                .filter(|r| &r.filter == filter && &r.content == content && r.export_path.is_dir())
+        };
+        let best = matching()
+            .find(|r| r.includes_attachments)
+            .or_else(|| matching().next());
+        match best {
+            Some(r) => Coverage {
+                covered: true,
+                with_attachments: r.includes_attachments,
+                export_path: Some(r.export_path.display().to_string()),
+            },
+            None => Coverage::default(),
+        }
     }
 }
 
@@ -89,18 +159,57 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn covers_requires_matching_filter_and_attachments() {
+    fn coverage_requires_matching_filter_content_and_attachments() {
         let tmp = TempDir::new().unwrap();
         let receipts = BackupReceipts::default();
         let key = FilterSpec::default().key();
-        assert!(!receipts.covers(&key, false));
+        let content = ContentFingerprint::of(&[1, 2], &[10]);
+        assert!(!receipts.coverage(&key, &content).covered);
 
-        receipts.record(key.clone(), false, tmp.path());
-        assert!(receipts.covers(&key, false));
-        assert!(!receipts.covers(&key, true));
+        receipts.record(key.clone(), content, false, tmp.path());
+        let c = receipts.coverage(&key, &content);
+        assert!(c.covered && !c.with_attachments);
 
-        receipts.record(key.clone(), true, tmp.path());
-        assert!(receipts.covers(&key, true));
+        receipts.record(key.clone(), content, true, tmp.path());
+        assert!(receipts.coverage(&key, &content).with_attachments);
+    }
+
+    #[test]
+    fn new_messages_since_the_backup_break_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let receipts = BackupReceipts::default();
+        let key = FilterSpec::default().key();
+        receipts.record(
+            key.clone(),
+            ContentFingerprint::of(&[1, 2], &[10]),
+            true,
+            tmp.path(),
+        );
+        // Same filter, but a message (or attachment) arrived afterwards.
+        assert!(
+            !receipts
+                .coverage(&key, &ContentFingerprint::of(&[1, 2, 3], &[10]))
+                .covered
+        );
+        assert!(
+            !receipts
+                .coverage(&key, &ContentFingerprint::of(&[1, 2], &[10, 11]))
+                .covered
+        );
+        // Order doesn't matter.
+        assert!(
+            receipts
+                .coverage(&key, &ContentFingerprint::of(&[2, 1], &[10]))
+                .covered
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_message_and_attachment_ids() {
+        assert_ne!(
+            ContentFingerprint::of(&[1], &[2]),
+            ContentFingerprint::of(&[2], &[1])
+        );
     }
 
     #[test]
@@ -110,12 +219,13 @@ mod tests {
         let export = tmp.path().join("Bubble Wrap 1");
         fs::create_dir_all(&export).unwrap();
         let key = FilterSpec::default().key();
+        let content = ContentFingerprint::of(&[1], &[]);
 
-        BackupReceipts::persistent(file.clone()).record(key.clone(), true, &export);
+        BackupReceipts::persistent(file.clone()).record(key.clone(), content, true, &export);
         let reloaded = BackupReceipts::persistent(file.clone());
-        assert!(reloaded.covers(&key, true));
+        assert!(reloaded.coverage(&key, &content).with_attachments);
 
         fs::remove_dir_all(&export).unwrap();
-        assert!(!reloaded.covers(&key, true));
+        assert!(!reloaded.coverage(&key, &content).covered);
     }
 }
