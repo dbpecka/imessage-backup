@@ -1,3 +1,4 @@
+pub mod attachment_copy;
 pub mod attachment_files;
 // Reading AddressBook only happens on macOS, but the matching logic is
 // platform-independent so it can be unit-tested anywhere.

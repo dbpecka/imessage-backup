@@ -199,6 +199,7 @@
   let deleteResult = $state<DeleteResult | null>(null);
   let deleteError = $state('');
   let icloudAcknowledged = $state(false);
+  let notOnMacAcknowledged = $state(false);
   let skipBackupAcknowledged = $state(false);
 
   let unlistenFocus: UnlistenFn | null = null;
@@ -323,10 +324,14 @@
     }
   }
 
-  function toggleChat(rowid: number) {
+  function isChatSelected(chat: ChatSummary) {
+    return chat.chatIds.some((id) => selectedChatIds.has(id));
+  }
+
+  function toggleChat(chat: ChatSummary) {
     const next = new Set(selectedChatIds);
-    if (next.has(rowid)) next.delete(rowid);
-    else next.add(rowid);
+    if (isChatSelected(chat)) for (const id of chat.chatIds) next.delete(id);
+    else next.add(chat.rowid);
     selectedChatIds = next;
   }
 
@@ -342,7 +347,15 @@
       filter.dateRange = { start: start || undefined, end: end || undefined };
     }
     if (selectedChatIds.size > 0) {
-      filter.chatIds = [...selectedChatIds];
+      // A listed conversation can span several chat rows (iMessage + SMS…);
+      // include all of them so nothing is left behind.
+      // Look up by any member id, since the primary row can change when the
+      // list is reloaded.
+      const byMember = new Map<number, number[]>();
+      for (const c of chats ?? []) for (const cid of c.chatIds) byMember.set(cid, c.chatIds);
+      const ids = new Set<number>();
+      for (const id of selectedChatIds) for (const cid of byMember.get(id) ?? [id]) ids.add(cid);
+      filter.chatIds = [...ids].sort((a, b) => a - b);
     }
     return filter;
   }
@@ -553,7 +566,8 @@
         deleteScope,
         // Only the user's own acknowledgement — never auto-ack, or the
         // backend gate is bypassed if its detection disagrees with ours.
-        acknowledgeIcloudSync: icloudAcknowledged
+        acknowledgeIcloudSync: icloudAcknowledged,
+        acknowledgeNotOnMac: notOnMacAcknowledged
       });
       await Promise.all([runPreview(), runDeletePreview(), loadChats()]);
     } catch (err) {
@@ -612,6 +626,10 @@
     runResult !== null && (!deleteAttachments || runResult.includesAttachments)
   );
 
+  // Attachment records whose files only exist in iCloud: no backup can
+  // include them, and deleting the records makes them unrecoverable.
+  const deletesNotOnMac = $derived(deleteAttachments && (deletePreview?.notOnMacCount ?? 0) > 0);
+
   const deletePreviewCurrent = $derived(
     deletePreview !== null &&
       !deletePreviewing &&
@@ -629,6 +647,7 @@
       !safety.messagesRunning &&
       (safety.icloudMessages === 'disabled' || icloudAcknowledged) &&
       (backupCoversDelete || skipBackupAcknowledged) &&
+      (!deletesNotOnMac || notOnMacAcknowledged) &&
       !deleting
   );
 
@@ -807,8 +826,8 @@
             <label>
               <input
                 type="checkbox"
-                checked={selectedChatIds.has(chat.rowid)}
-                onchange={() => toggleChat(chat.rowid)}
+                checked={isChatSelected(chat)}
+                onchange={() => toggleChat(chat)}
               />
               <span class="name">{displayName(chat)}</span>
               <span class="meta">
@@ -958,22 +977,49 @@
 
     {#if runResult}
       <div class="summary">
-        <p class="ok">Backup complete — {runResult.format.toUpperCase()}.</p>
+        <p class="ok">Backup {runResult.attachmentCopy && runResult.attachmentCopy.failed > 0 ? 'finished with errors' : 'complete'} — {runResult.format.toUpperCase()}.</p>
         <ul>
           <li>{runResult.messageCount.toLocaleString()} messages</li>
           <li>{runResult.conversationCount.toLocaleString()} conversations</li>
-          <li>
-            {runResult.attachmentCount.toLocaleString()} attachments
-            {#if runResult.attachmentBytesCopied > 0}
-              ({formatBytes(runResult.attachmentBytesCopied)} copied)
+          {#if runResult.attachmentCopy}
+            {@const ac = runResult.attachmentCopy}
+            <li>
+              {ac.copied.toLocaleString()} of {ac.attempted.toLocaleString()} attachments copied
+              ({formatBytes(ac.bytes)})
+            </li>
+            {#if ac.notOnMac > 0}
+              <li>
+                {ac.notOnMac.toLocaleString()} not downloaded to this Mac (not in this backup)
+              </li>
             {/if}
-          </li>
+            {#if ac.unresolvable > 0}
+              <li>{ac.unresolvable.toLocaleString()} with no file to copy</li>
+            {/if}
+          {:else}
+            <li>
+              {runResult.attachmentCount.toLocaleString()} attachments (referenced, not copied)
+            </li>
+          {/if}
+          <li>Saved to <code>{runResult.exportPath}</code></li>
           {#if runResult.manifestPath}
             <li>
               Manifest: <code>{runResult.manifestPath}</code>
             </li>
           {/if}
         </ul>
+        {#if runResult.attachmentCopy && runResult.attachmentCopy.failed > 0}
+          <p class="err">
+            {runResult.attachmentCopy.failed.toLocaleString()} attachment{runResult.attachmentCopy
+              .failed === 1
+              ? ''
+              : 's'} failed to copy:
+          </p>
+          <ul class="meta">
+            {#each runResult.attachmentCopy.failures as f, i (i)}
+              <li><code>{f}</code></li>
+            {/each}
+          </ul>
+        {/if}
       </div>
     {/if}
   </section>
@@ -1016,19 +1062,20 @@
       {/if}
       {#if safety?.icloudMessages === 'enabled'}
         <p class="err">
-          <strong>Messages in iCloud is enabled.</strong> Deletes on this Mac will replicate to all
-          your other devices signed into the same Apple ID. Disable it in
-          <strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong> if you
-          want local-only deletion.
+          <strong>Messages in iCloud is enabled.</strong> Bubble Wrap edits this Mac's Messages
+          database directly, which Messages in iCloud doesn't track: the delete may not reach your
+          other devices, and deleted messages may be downloaded to this Mac again. For predictable
+          results, turn it off in
+          <strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong> first.
         </p>
         <label class="checkbox">
           <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
-          I understand deletes will sync to my other devices and want to proceed anyway.
+          I understand deleted messages may come back from iCloud and want to proceed anyway.
         </label>
       {:else if safety?.icloudMessages === 'unknown'}
         <p class="meta">
-          Couldn't confirm Messages-in-iCloud state. If it's enabled, deletes will replicate to your
-          other devices.
+          Couldn't confirm Messages-in-iCloud state. If it's enabled, deleted messages may be
+          downloaded to this Mac again, and the delete may not reach your other devices.
         </p>
         <label class="checkbox">
           <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
@@ -1075,9 +1122,29 @@
           <p class="meta">Select at least one option above.</p>
         {/if}
 
+        {#if deletesNotOnMac && deletePreview}
+          <p class="err">
+            {deletePreview.notOnMacCount.toLocaleString()} attachment{deletePreview.notOnMacCount ===
+            1
+              ? ''
+              : 's'} in this delete {deletePreview.notOnMacCount === 1 ? "isn't" : "aren't"} downloaded
+            to this Mac, so no backup can include {deletePreview.notOnMacCount === 1 ? 'it' : 'them'}.
+            Deleting removes the only way to download {deletePreview.notOnMacCount === 1
+              ? 'it'
+              : 'them'} again. Open those conversations in Messages to download first.
+          </p>
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={notOnMacAcknowledged} disabled={deleting} />
+            Delete them anyway — I accept they can't be recovered.
+          </label>
+        {/if}
+
         {#if !backupCoversDelete}
           <p class="meta">
-            {#if runResult}
+            {#if runResult?.attachmentCopy && runResult.attachmentCopy.failed > 0}
+              Some attachments failed to copy during your backup, so it doesn't protect them. Fix
+              the errors listed in Step 4 and re-run the backup, or delete without that protection.
+            {:else if runResult}
               Your backup didn't copy attachment files. Deleted attachments can't be restored from
               the safety snapshot — re-run the backup (Step 4) with attachments copied.
             {:else}

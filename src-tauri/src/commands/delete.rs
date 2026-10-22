@@ -1,9 +1,9 @@
-use imessage_database::tables::{
-    table::{get_connection, get_writable_connection},
-    write::{
+use imessage_database::{
+    tables::write::{
         attachment_filter::AttachmentFilter,
         delete::{execute_delete, preview_delete as lib_preview_delete, DeletePlan},
     },
+    util::query_context::QueryContext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -14,14 +14,15 @@ use tauri::{AppHandle, State};
 use crate::core::attachment_files::{
     attachment_roots, expand_tilde, path_key, remove_attachment_file, RemoveOutcome,
 };
-use crate::core::db_path::default_chat_db_path;
+use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write};
 use crate::core::filter::FilterSpec;
 use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::core::receipts::BackupReceipts;
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
-    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SNAPSHOTS_TO_KEEP,
+    checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
+    SNAPSHOTS_TO_KEEP,
 };
 use crate::error::AppError;
 
@@ -109,6 +110,115 @@ pub(crate) fn exclude_shared_attachments(
     Ok(())
 }
 
+/// What actually happens to a direct chat.db edit on an iCloud-synced
+/// account. Bubble Wrap bypasses Messages' own sync bookkeeping, so the
+/// delete is neither reliably propagated nor protected from re-download.
+const ICLOUD_RISK: &str = "Bubble Wrap edits this Mac's Messages database directly, which \
+    Messages in iCloud doesn't track: the delete may not reach your other devices, and deleted \
+    messages may be downloaded to this Mac again from iCloud.";
+
+/// Extract the target message guid from an `associated_message_guid`
+/// (`p:0/<guid>`, `bp:<guid>`, or a bare guid).
+fn reaction_target(associated: &str) -> &str {
+    if let Some(rest) = associated.strip_prefix("bp:") {
+        rest
+    } else if let Some(rest) = associated.strip_prefix("p:") {
+        rest.split_once('/').map_or(rest, |(_, g)| g)
+    } else {
+        associated
+    }
+}
+
+fn is_missing_column(e: &rusqlite::Error) -> bool {
+    // Reported as `SqlInputError` or `SqliteFailure` depending on the
+    // rusqlite build; the message is the stable part.
+    e.to_string().contains("no such column")
+}
+
+/// Add tapbacks (and tapback removals) whose target message is being
+/// deleted, so they aren't left pointing at nothing. Reactions that carry
+/// attachments (sticker reactions) are left alone rather than orphaning
+/// their attachment.
+pub(crate) fn add_orphaned_reactions(
+    conn: &Connection,
+    plan: &mut DeletePlan,
+) -> Result<(), AppError> {
+    if plan.message_rowids.is_empty() {
+        return Ok(());
+    }
+    let mut guids: HashSet<String> = HashSet::new();
+    for chunk in plan.message_rowids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT guid FROM message WHERE ROWID IN ({placeholders})"
+        ))?;
+        for g in stmt.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))? {
+            guids.insert(g?);
+        }
+    }
+
+    let stmt = conn.prepare(
+        "SELECT ROWID, associated_message_guid FROM message \
+         WHERE associated_message_guid IS NOT NULL \
+           AND associated_message_type BETWEEN 2000 AND 3999 \
+           AND COALESCE(cache_has_attachments, 0) = 0",
+    );
+    let mut stmt = match stmt {
+        Ok(s) => s,
+        // Very old (or test) schemas don't track reactions this way.
+        Err(e) if is_missing_column(&e) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let planned: HashSet<i64> = plan.message_rowids.iter().copied().collect();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (rowid, associated) = row?;
+        if !planned.contains(&rowid) && guids.contains(reaction_target(&associated)) {
+            plan.message_rowids.push(rowid);
+        }
+    }
+    plan.message_rowids.sort_unstable();
+    plan.message_rowids.dedup();
+    Ok(())
+}
+
+/// Planned attachments whose file isn't on this Mac (typically offloaded to
+/// iCloud). No backup can include them, and deleting their records removes
+/// the only way to download them again.
+pub(crate) fn count_not_on_mac(conn: &Connection, plan: &DeletePlan) -> Result<u64, AppError> {
+    let mut n = 0u64;
+    for chunk in plan.attachment_rowids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT filename FROM attachment WHERE ROWID IN ({placeholders})"
+        ))?;
+        for f in stmt.query_map(params_from_iter(chunk.iter()), |r| {
+            r.get::<_, Option<String>>(0)
+        })? {
+            if let Some(f) = f? {
+                if !expand_tilde(&f).exists() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// The full (unscoped) plan for `ctx`, shared by the preview and the delete
+/// so the counts the user confirms are the counts that get deleted.
+pub(crate) fn build_plan(
+    conn: &Connection,
+    ctx: &QueryContext,
+    db_path: &std::path::Path,
+) -> Result<DeletePlan, AppError> {
+    let mut plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
+        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    add_orphaned_reactions(conn, &mut plan)?;
+    exclude_shared_attachments(conn, &mut plan)?;
+    Ok(plan)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeletePreview {
@@ -116,25 +226,27 @@ pub struct DeletePreview {
     pub attachment_count: u64,
     pub attachment_bytes: u64,
     pub on_disk_file_count: u64,
+    /// Matched attachments whose file isn't on this Mac.
+    pub not_on_mac_count: u64,
 }
 
 /// Compute what a delete with the given filter would remove. Read-only.
 #[tauri::command]
 pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppError> {
     let db_path = default_chat_db_path()?;
-    let conn = get_connection(&db_path)?;
     let ctx = filter.to_query_context()?;
-
-    let mut plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path)
-        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
-    exclude_shared_attachments(&conn, &mut plan)?;
-
-    Ok(DeletePreview {
-        message_count: plan.message_rowids.len() as u64,
-        attachment_count: plan.attachment_rowids.len() as u64,
-        attachment_bytes: plan.attachment_bytes,
-        on_disk_file_count: plan.attachment_files_on_disk.len() as u64,
+    blocking(move || {
+        let conn = open_read(&db_path)?;
+        let plan = build_plan(&conn, &ctx, &db_path)?;
+        Ok(DeletePreview {
+            message_count: plan.message_rowids.len() as u64,
+            attachment_count: plan.attachment_rowids.len() as u64,
+            attachment_bytes: plan.attachment_bytes,
+            on_disk_file_count: plan.attachment_files_on_disk.len() as u64,
+            not_on_mac_count: count_not_on_mac(&conn, &plan)?,
+        })
     })
+    .await
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -158,22 +270,25 @@ pub struct RunDeleteArgs {
     pub confirmation_phrase: String,
     /// Required when no backup with exactly this filter ran in this session
     /// (or, when attachment files will be deleted, when that backup didn't
-    /// copy attachments). Whether a backup ran is checked against the
+    /// copy all of them). Whether a backup ran is checked against the
     /// backend's own receipts — the frontend can't assert it.
     #[serde(default)]
     pub acknowledge_skip_backup: bool,
     /// Optional override for where snapshots are stored. Defaults to
-    /// `~/Documents/iMessage Backups/snapshots/<timestamp>/`.
+    /// `<app data>/snapshots/delete/<timestamp>/`.
     pub snapshot_root: Option<String>,
     /// Controls which parts of the matched records are removed.
     #[serde(default)]
     pub delete_scope: DeleteScope,
     /// Must be `true` unless Messages in iCloud is positively detected as
-    /// disabled. A local delete on a synced account can be re-synced from
-    /// cloud state, so the caller has to prove they understand the
-    /// consequences.
+    /// disabled.
     #[serde(default)]
     pub acknowledge_icloud_sync: bool,
+    /// Required when attachment records will be deleted and some of their
+    /// files aren't on this Mac: those can't be backed up and become
+    /// unrecoverable.
+    #[serde(default)]
+    pub acknowledge_not_on_mac: bool,
     /// Messages the user was shown and confirmed (0 when the scope keeps
     /// messages). When set, the delete refuses if the plan differs — e.g.
     /// the filter changed after the preview was computed.
@@ -259,10 +374,11 @@ fn ensure_messages_not_running() -> Result<(), AppError> {
 
 /// Execute a delete. Enforces the full safety contract: typed
 /// confirmation, backup (or explicit skip), Messages.app-not-running,
-/// iCloud acknowledgement, mandatory snapshot with a WAL checkpoint, then a
-/// transactional delete against a writable connection. Attachment files on
-/// disk are unlinked **after** the SQL transaction commits; individual
-/// unlink failures are counted but do not roll back.
+/// iCloud acknowledgement, a plan matching what the user confirmed,
+/// mandatory snapshot with a WAL checkpoint, then a transactional delete
+/// against a writable connection. Attachment files on disk are unlinked
+/// **after** the SQL transaction commits; individual unlink failures are
+/// counted but do not roll back.
 #[tauri::command]
 pub async fn run_delete(
     app: AppHandle,
@@ -292,125 +408,137 @@ pub async fn run_delete(
     match detect_icloud_messages().unwrap_or(ICloudState::Unknown) {
         ICloudState::Disabled => {}
         ICloudState::Enabled if !args.acknowledge_icloud_sync => {
-            return Err(AppError::Other(
-                "Messages in iCloud is enabled. A local delete may be re-synced from cloud. \
-                 Acknowledge the iCloud warning in the UI (or pass acknowledgeIcloudSync=true) \
-                 before retrying."
-                    .into(),
-            ));
+            return Err(AppError::Other(format!(
+                "Messages in iCloud is enabled. {ICLOUD_RISK} Acknowledge the iCloud warning \
+                 in the UI (or pass acknowledgeIcloudSync=true) before retrying."
+            )));
         }
         ICloudState::Unknown if !args.acknowledge_icloud_sync => {
-            return Err(AppError::Other(
-                "Couldn't determine whether Messages in iCloud is enabled. Acknowledge the \
-                 iCloud warning in the UI (or pass acknowledgeIcloudSync=true) before retrying."
-                    .into(),
-            ));
+            return Err(AppError::Other(format!(
+                "Couldn't determine whether Messages in iCloud is enabled. If it is: \
+                 {ICLOUD_RISK} Acknowledge the iCloud warning in the UI (or pass \
+                 acknowledgeIcloudSync=true) before retrying."
+            )));
         }
         _ => {}
     }
 
     let db_path = default_chat_db_path()?;
-
-    // Build the delete plan against a read-only connection — even though
-    // we'll execute it against a writable one, there's no reason to hold
-    // two writers, and the read-only path is more conservative.
-    let read_conn = get_connection(&db_path)?;
     let ctx = args.filter.to_query_context()?;
-    let mut plan = lib_preview_delete(&read_conn, &ctx, &AttachmentFilter::any(), &db_path)
-        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
-    exclude_shared_attachments(&read_conn, &mut plan)?;
-    drop(read_conn);
-
-    // A messages-only delete also drops the message_attachment_join rows,
-    // leaving the kept attachments unlinked; the orphan cleaner must skip
-    // them.
-    let keep_attachments = if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
-        plan.attachment_rowids.clone()
-    } else {
-        Vec::new()
-    };
-
-    apply_scope(&mut plan, &args.delete_scope);
-
-    // Gate 3: the plan must match what the user confirmed.
-    check_expected_counts(
-        &plan,
-        args.expected_message_count,
-        args.expected_attachment_count,
-    )?;
-
-    // Gate 4: mandatory WAL checkpoint + snapshot.
     let (snapshot_root, managed_root) = match args.snapshot_root.as_deref() {
         Some(p) if !p.is_empty() => (
             crate::core::paths::validate_user_path(p, "snapshot root")?,
             false,
         ),
-        _ => (default_snapshot_root(&app)?, true),
+        _ => (default_snapshot_root(&app, SnapshotKind::Delete)?, true),
     };
-
-    checkpoint_wal(&db_path)?;
-    let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
-    if managed_root {
-        // Only ever prune the folder we own; a caller-chosen root is theirs.
-        prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
-    }
-
-    // Re-check right before writing: the snapshot of a large chat.db can
-    // take long enough for the user to reopen Messages.
-    ensure_messages_not_running()?;
-
-    // Record kept attachments before the transaction (so a crash after
-    // commit can't leave them unprotected) and roll the record back if the
-    // transaction fails.
     let retained = RetainedAttachments::for_app(&app)?;
-    let newly_retained = retained.add(&keep_attachments)?;
 
-    // Now execute against a writable connection.
-    let mut write_conn = get_writable_connection(&db_path)?;
-    let report = match execute_delete(&mut write_conn, &plan) {
-        Ok(r) => r,
-        Err(e) => {
-            if let Err(re) = retained.remove(&newly_retained) {
-                eprintln!("delete: failed to roll back retained attachment list: {re:?}");
-            }
-            return Err(AppError::Database(format!(
-                "delete transaction failed (rolled back; no changes made): {e}"
+    blocking(move || {
+        // Build the delete plan against a read-only connection — even
+        // though we'll execute it against a writable one, there's no reason
+        // to hold two writers, and the read-only path is more conservative.
+        let read_conn = open_read(&db_path)?;
+        let mut plan = build_plan(&read_conn, &ctx, &db_path)?;
+
+        // A messages-only delete also drops the message_attachment_join
+        // rows, leaving the kept attachments unlinked; the orphan cleaner
+        // must skip them.
+        let keep_attachments = if matches!(args.delete_scope, DeleteScope::MessagesOnly) {
+            plan.attachment_rowids.clone()
+        } else {
+            Vec::new()
+        };
+
+        apply_scope(&mut plan, &args.delete_scope);
+
+        // Gate 3: the plan must match what the user confirmed.
+        check_expected_counts(
+            &plan,
+            args.expected_message_count,
+            args.expected_attachment_count,
+        )?;
+
+        // Gate 3a: attachments that exist only in iCloud can't be backed up
+        // and become unrecoverable once their records are gone.
+        let not_on_mac = count_not_on_mac(&read_conn, &plan)?;
+        drop(read_conn);
+        if not_on_mac > 0 && !args.acknowledge_not_on_mac {
+            return Err(AppError::Other(format!(
+                "{not_on_mac} attachments in this delete aren't downloaded to this Mac, so no \
+                 backup can include them and they can't be recovered afterwards. Download them \
+                 in Messages first, or pass acknowledgeNotOnMac=true to delete them anyway."
             )));
         }
-    };
-    // Release the writable handle immediately so Messages.app can reopen.
-    drop(write_conn);
 
-    // Unlink attachment files from disk. Failures are non-fatal — the DB is
-    // the source of truth, so a stale file on disk is a minor janitor issue,
-    // not a data-integrity event. Paths come from chat.db, so only regular
-    // files inside the Messages attachment folders are ever removed.
-    let roots = attachment_roots();
-    let mut removed = 0u64;
-    let mut failed = 0u64;
-    let mut skipped = 0u64;
-    for p in &plan.attachment_files_on_disk {
-        match remove_attachment_file(p, &roots, "delete") {
-            RemoveOutcome::Removed => removed += 1,
-            RemoveOutcome::Missing => {}
-            RemoveOutcome::Refused => skipped += 1,
-            RemoveOutcome::Failed => failed += 1,
+        // Gate 4: mandatory WAL checkpoint + snapshot.
+        checkpoint_wal(&db_path)?;
+        let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
+        if managed_root {
+            // Only ever prune the folder we own; a caller-chosen root is
+            // theirs.
+            prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
         }
-    }
 
-    Ok(DeleteResult {
-        messages_deleted: report.messages_deleted as u64,
-        attachments_deleted: report.attachments_deleted as u64,
-        attachment_joins_deleted: report.attachment_joins_deleted as u64,
-        chat_message_joins_deleted: report.chat_message_joins_deleted as u64,
-        orphan_chats_deleted: report.orphan_chats_deleted as u64,
-        orphan_handles_deleted: report.orphan_handles_deleted as u64,
-        snapshot_path: snapshot.dir.display().to_string(),
-        on_disk_files_removed: removed,
-        on_disk_files_failed: failed,
-        on_disk_files_skipped: skipped,
-        backup_verified,
+        // Re-check right before writing: the snapshot of a large chat.db
+        // can take long enough for the user to reopen Messages.
+        ensure_messages_not_running()?;
+
+        // Record kept attachments before the transaction (so a crash after
+        // commit can't leave them unprotected) and roll the record back if
+        // the transaction fails.
+        let newly_retained = retained.add(&keep_attachments)?;
+
+        // Now execute against a writable connection.
+        let mut write_conn = open_write(&db_path)?;
+        let report = match execute_delete(&mut write_conn, &plan) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Err(re) = retained.remove(&newly_retained) {
+                    eprintln!("delete: failed to roll back retained attachment list: {re:?}");
+                }
+                return Err(AppError::Database(format!(
+                    "delete transaction failed (rolled back; no changes made): {e}"
+                )));
+            }
+        };
+        // Release the writable handle immediately so Messages.app can
+        // reopen.
+        drop(write_conn);
+
+        // Unlink attachment files from disk. Failures are non-fatal — the
+        // DB is the source of truth, so a stale file on disk is a minor
+        // janitor issue, not a data-integrity event. Paths come from
+        // chat.db, so only regular files inside the Messages attachment
+        // folders are ever removed.
+        let roots = attachment_roots();
+        let mut removed = 0u64;
+        let mut failed = 0u64;
+        let mut skipped = 0u64;
+        for p in &plan.attachment_files_on_disk {
+            match remove_attachment_file(p, &roots, "delete") {
+                RemoveOutcome::Removed => removed += 1,
+                RemoveOutcome::Missing => {}
+                RemoveOutcome::Refused => skipped += 1,
+                RemoveOutcome::Failed => failed += 1,
+            }
+        }
+
+        Ok(DeleteResult {
+            messages_deleted: report.messages_deleted as u64,
+            attachments_deleted: report.attachments_deleted as u64,
+            attachment_joins_deleted: report.attachment_joins_deleted as u64,
+            chat_message_joins_deleted: report.chat_message_joins_deleted as u64,
+            orphan_chats_deleted: report.orphan_chats_deleted as u64,
+            orphan_handles_deleted: report.orphan_handles_deleted as u64,
+            snapshot_path: snapshot.dir.display().to_string(),
+            on_disk_files_removed: removed,
+            on_disk_files_failed: failed,
+            on_disk_files_skipped: skipped,
+            backup_verified,
+        })
     })
+    .await
 }
 
 #[cfg(test)]
@@ -636,6 +764,68 @@ mod tests {
         // Row 3 goes, but its file is still used by row 4.
         assert!(plan.attachment_files_on_disk.contains(&att1));
         assert!(!plan.attachment_files_on_disk.contains(&shared_file));
+    }
+
+    #[test]
+    fn reaction_targets_are_parsed() {
+        assert_eq!(reaction_target("p:0/ABC-123"), "ABC-123");
+        assert_eq!(reaction_target("p:12/ABC"), "ABC");
+        assert_eq!(reaction_target("bp:ABC"), "ABC");
+        assert_eq!(reaction_target("ABC"), "ABC");
+    }
+
+    #[test]
+    fn tapbacks_on_deleted_messages_are_deleted_too() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE message ADD COLUMN associated_message_guid TEXT;
+             ALTER TABLE message ADD COLUMN associated_message_type INTEGER DEFAULT 0;
+             ALTER TABLE message ADD COLUMN cache_has_attachments INTEGER DEFAULT 0;
+             INSERT INTO chat (ROWID, chat_identifier) VALUES (2, 'other');
+             -- Tapback in another chat on message g1 (being deleted): goes.
+             INSERT INTO message (ROWID, guid, date, associated_message_guid, associated_message_type)
+               VALUES (10, 'r1', 0, 'p:0/g1', 2000);
+             -- Sticker reaction with an attachment on g1: stays.
+             INSERT INTO message (ROWID, guid, date, associated_message_guid, associated_message_type, cache_has_attachments)
+               VALUES (11, 'r2', 0, 'p:0/g1', 2007, 1);
+             -- Tapback on a message that is kept: stays.
+             INSERT INTO message (ROWID, guid, date) VALUES (12, 'kept', 0);
+             INSERT INTO message (ROWID, guid, date, associated_message_guid, associated_message_type)
+               VALUES (13, 'r3', 0, 'p:0/kept', 2001);
+             -- A reply (not a reaction) to g1: stays.
+             INSERT INTO message (ROWID, guid, date, associated_message_guid, associated_message_type)
+               VALUES (14, 'r4', 0, 'g1', 0);
+             INSERT INTO chat_message_join VALUES (2, 10), (2, 11), (2, 12), (2, 13), (2, 14);",
+        )
+        .unwrap();
+
+        let mut ctx = QueryContext::default();
+        ctx.set_selected_chat_ids(std::collections::BTreeSet::from([1]));
+        let plan = build_plan(&conn, &ctx, &db_path).unwrap();
+        assert_eq!(plan.message_rowids, vec![1, 2, 10]);
+    }
+
+    #[test]
+    fn reactions_are_skipped_on_schemas_without_them() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        let plan = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        assert_eq!(plan.message_rowids, vec![1, 2]);
+    }
+
+    #[test]
+    fn not_on_mac_counts_missing_files_only() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO attachment (ROWID, filename) VALUES (2, '/nowhere/offloaded.jpg'), (3, NULL);
+             INSERT INTO message_attachment_join VALUES (1, 2), (1, 3);",
+        )
+        .unwrap();
+        let plan = build_plan(&conn, &QueryContext::default(), &db_path).unwrap();
+        // Row 1's file exists, row 2's doesn't, row 3 has no file at all.
+        assert_eq!(count_not_on_mac(&conn, &plan).unwrap(), 1);
     }
 
     #[test]
