@@ -407,6 +407,33 @@
     void selectedChatIds;
     runResult = null;
     skipBackupAcknowledged = false;
+    // The "not on this Mac" acknowledgement was for a specific set of
+    // attachments; a different filter needs a fresh decision.
+    notOnMacAcknowledged = false;
+  });
+
+  // Likewise the iCloud acknowledgement is for the state the user saw. A
+  // derived only notifies when its value changes, so re-probing the same
+  // state (as runDelete does) doesn't clear it.
+  const icloudState = $derived(safety?.icloudMessages ?? null);
+  $effect(() => {
+    void icloudState;
+    icloudAcknowledged = false;
+  });
+
+  // Backups are plain, unencrypted copies of every message and attachment.
+  // Point it out more strongly where the folder is likely to leave the Mac
+  // or be readable by others.
+  const destinationRisk = $derived.by(() => {
+    const d = destination;
+    if (!d) return '';
+    if (d.startsWith('/Volumes/'))
+      return 'This is an external drive. Anyone with the drive can read the backup — many drive formats have no file permissions.';
+    if (d.includes('/Library/Mobile Documents/'))
+      return 'This folder is in iCloud Drive, so the backup will be uploaded to iCloud and may be removed from this Mac to save space.';
+    if (/\/Users\/[^/]+\/(Desktop|Documents)(\/|$)/.test(d))
+      return 'If "Desktop & Documents" syncing is on in iCloud settings, this backup will be uploaded to iCloud Drive and may be removed from this Mac to save space.';
+    return '';
   });
 
   async function pickDestination() {
@@ -543,9 +570,15 @@
     try {
       // Final safety probe: Messages.app could have reopened between the
       // preview and the click.
+      const icloudBefore = safety?.icloudMessages;
       const safetyOk = await refreshSafety();
       if (!safetyOk) {
         // refreshSafety already populated deleteError.
+        return;
+      }
+      if (safety?.icloudMessages !== icloudBefore) {
+        deleteError =
+          'The Messages in iCloud status changed. Review the updated warning above before retrying.';
         return;
       }
       if (safety?.messagesRunning) {
@@ -943,6 +976,14 @@
       Copy attachment files into the backup folder
     </label>
 
+    <p class="meta">
+      Backups aren't encrypted: anyone who can open the folder can read every message and
+      attachment in it.
+    </p>
+    {#if destinationRisk}
+      <p class="err">{destinationRisk}</p>
+    {/if}
+
     <div class="actions">
       <button
         class="primary"
@@ -1024,6 +1065,18 @@
     {/if}
   </section>
 
+  {#snippet reactionNote()}
+    {#if deletePreview && deletePreview.reactionCount > 0}
+      <p class="meta">
+        Includes {deletePreview.reactionCount.toLocaleString()} tapback{deletePreview.reactionCount ===
+        1
+          ? ''
+          : 's'} outside the filter on messages being deleted, so the backup preview above shows
+        fewer messages.
+      </p>
+    {/if}
+  {/snippet}
+
   <section class="card danger">
     <header class="card-head">
       <span class="step step-danger">5</span>
@@ -1036,6 +1089,13 @@
       </p>
       <button onclick={expandDelete}>Show delete controls</button>
     {:else}
+      {#if safety?.legacySnapshotDir}
+        <p class="meta">
+          Earlier versions of Bubble Wrap kept full copies of your messages in
+          <code>{safety.legacySnapshotDir}</code>, which may sync to iCloud Drive. New snapshots go
+          to the app's own folder; delete the old ones if you don't need them.
+        </p>
+      {/if}
       {#if safety?.messagesRunning}
         <p class="err" style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;">
           <span>The Messages app is currently running. Please quit it before deleting messages.</span>
@@ -1106,11 +1166,13 @@
             ({formatBytes(deletePreview.attachmentBytes)} on disk across
             {deletePreview.onDiskFileCount.toLocaleString()} files).
           </p>
+          {@render reactionNote()}
         {:else if deleteMessages}
           <p>
             Will delete <strong>{deletePreview.messageCount.toLocaleString()}</strong> messages.
             Attachment records and files will be left on disk.
           </p>
+          {@render reactionNote()}
         {:else if deleteAttachments}
           <p>
             Will delete <strong>{deletePreview.attachmentCount.toLocaleString()}</strong> attachment
@@ -1200,6 +1262,12 @@
               Snapshot: <code>{deleteResult.snapshotPath}</code>
             </li>
           </ul>
+          <p class="meta">
+            To undo, quit Messages, replace <code>~/Library/Messages/chat.db</code> with the
+            <code>chat.db</code> in the snapshot folder, and delete <code>chat.db-wal</code> and
+            <code>chat.db-shm</code> next to it. Deleted attachment files aren't in the snapshot —
+            restore them from your backup.
+          </p>
         </div>
       {/if}
     {/if}

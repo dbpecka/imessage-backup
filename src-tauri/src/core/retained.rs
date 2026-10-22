@@ -33,16 +33,31 @@ impl RetainedAttachments {
     }
 
     pub fn load(&self) -> Result<BTreeSet<i64>, AppError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                AppError::Other(format!(
-                    "failed to read retained attachment list {}: {e}",
-                    self.path.display()
-                ))
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-            Err(e) => Err(e.into()),
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(e) => return Err(e.into()),
+        };
+        if let Ok(set) = serde_json::from_slice(&bytes) {
+            return Ok(set);
         }
+        // Damaged (shouldn't happen with atomic writes, but a failing disk
+        // or a hand edit can do it). Refusing to load would block every
+        // cleanup and messages-only delete for good; starting empty would
+        // silently unprotect kept attachments. Instead keep every number
+        // we can still find — protecting a few extra ids is harmless — and
+        // set the damaged file aside for inspection.
+        let salvaged = salvage_ids(&bytes);
+        let aside = self.path.with_extension("json.damaged");
+        eprintln!(
+            "retained: {} was unreadable; recovered {} ids, original kept at {}",
+            self.path.display(),
+            salvaged.len(),
+            aside.display()
+        );
+        fs::copy(&self.path, &aside)?;
+        self.save(&salvaged)?;
+        Ok(salvaged)
     }
 
     /// Merge `ids` into the persisted set and return the ones that weren't
@@ -87,6 +102,14 @@ impl RetainedAttachments {
     }
 }
 
+/// Every integer in `bytes`, however mangled the surrounding JSON is.
+fn salvage_ids(bytes: &[u8]) -> BTreeSet<i64> {
+    String::from_utf8_lossy(bytes)
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter_map(|t| t.parse::<i64>().ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +127,21 @@ mod tests {
         // Undoing the second add leaves ids that were already there.
         r.remove(&[2]).unwrap();
         assert_eq!(r.load().unwrap(), BTreeSet::from([1, 3]));
+    }
+
+    #[test]
+    fn damaged_list_is_salvaged_not_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let r = RetainedAttachments::in_dir(tmp.path());
+        fs::write(tmp.path().join(FILE_NAME), b"[12,34,5\x00garbage").unwrap();
+        assert_eq!(r.load().unwrap(), BTreeSet::from([5, 12, 34]));
+        assert!(tmp
+            .path()
+            .join("retained_attachments.json.damaged")
+            .exists());
+        // Rewritten as valid JSON.
+        assert_eq!(r.load().unwrap(), BTreeSet::from([5, 12, 34]));
+        r.add(&[7]).unwrap();
+        assert_eq!(r.load().unwrap(), BTreeSet::from([5, 7, 12, 34]));
     }
 }

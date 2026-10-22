@@ -147,6 +147,8 @@ export type ICloudState = 'enabled' | 'disabled' | 'unknown';
 export type SafetyStatus = {
   messagesRunning: boolean;
   icloudMessages: ICloudState;
+  /** Folder of chat.db copies left by earlier versions, if any remain. */
+  legacySnapshotDir: string | null;
 };
 
 export type DeletePreview = {
@@ -156,6 +158,8 @@ export type DeletePreview = {
   onDiskFileCount: number;
   /** Matched attachments whose file isn't downloaded to this Mac. */
   notOnMacCount: number;
+  /** Of messageCount: tapbacks outside the filter on messages being deleted. */
+  reactionCount: number;
 };
 
 export type DeleteScope = 'both' | 'messages_only' | 'attachments_only';

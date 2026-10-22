@@ -18,6 +18,7 @@ use crate::core::attachment_copy::{
 };
 use crate::core::db_path::{blocking, check_chat_db_access, default_chat_db_path, open_read};
 use crate::core::filter::FilterSpec;
+use crate::core::op_lock::OperationLock;
 use crate::core::progress::TauriProgress;
 use crate::core::receipts::BackupReceipts;
 use crate::core::snapshot::create_unique_dir;
@@ -67,8 +68,11 @@ pub struct BackupResult {
 pub async fn run_backup(
     app: AppHandle,
     receipts: State<'_, BackupReceipts>,
+    lock: State<'_, OperationLock>,
     args: RunBackupArgs,
 ) -> Result<BackupResult, AppError> {
+    // A delete or cleanup running alongside could remove files mid-copy.
+    let _guard = lock.try_acquire("a backup")?;
     let format = ExportType::from_cli(&args.format)
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
 
@@ -214,7 +218,11 @@ pub async fn run_backup(
     // Only a backup that ran to completion counts toward `run_delete`'s
     // backup gate, and it only vouches for attachments if every copy that
     // could be made was made.
-    receipts.record(filter_key, result.includes_attachments);
+    receipts.record(
+        filter_key,
+        result.includes_attachments,
+        std::path::Path::new(&result.export_path),
+    );
 
     Ok(result)
 }

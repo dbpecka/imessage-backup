@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 
 use crate::core::attachment_files::{
     attachment_roots, expand_tilde, is_within_roots, path_key, remove_attachment_file, walk_files,
@@ -13,6 +13,7 @@ use crate::core::attachment_files::{
 };
 use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write};
 use crate::core::messages_app::is_messages_running;
+use crate::core::op_lock::OperationLock;
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
     checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
@@ -89,8 +90,8 @@ struct Orphans {
     retained_bytes: u64,
     /// Retained ids included in `db` because the caller asked for them.
     included_retained: Vec<i64>,
-    /// Retained ids that no longer name an unlinked row (deleted, or linked
-    /// to a message again) and can be dropped from the list.
+    /// Retained ids whose attachment record no longer exists and can be
+    /// dropped from the list.
     stale_retained: Vec<i64>,
 }
 
@@ -169,7 +170,7 @@ fn find_orphans(
     let mut referenced_dirs: HashSet<String> = HashSet::new();
     let mut kept_files: HashSet<String> = HashSet::new();
     let mut candidates: Vec<(i64, Option<PathBuf>)> = Vec::new();
-    let mut unlinked_retained: HashSet<i64> = HashSet::new();
+    let mut existing: HashSet<i64> = HashSet::new();
     let mut out = Orphans::default();
 
     for (rowid, filename, linked) in rows {
@@ -179,10 +180,8 @@ fn find_orphans(
                 referenced_dirs.insert(path_key(parent));
             }
         }
+        existing.insert(rowid);
         let is_retained = !linked && retained.contains(&rowid);
-        if is_retained {
-            unlinked_retained.insert(rowid);
-        }
         if linked || (is_retained && !include_retained) {
             if let Some(p) = &path {
                 kept_files.insert(path_key(p));
@@ -200,10 +199,13 @@ fn find_orphans(
             candidates.push((rowid, path));
         }
     }
+    // Only forget ids whose record is gone. A retained id that is linked
+    // right now may belong to a messages-only delete that is about to
+    // commit; dropping it would leave the attachment unprotected.
     out.stale_retained = retained
         .iter()
         .copied()
-        .filter(|id| !unlinked_retained.contains(id))
+        .filter(|id| !existing.contains(id))
         .collect();
 
     for (rowid, path) in candidates {
@@ -231,7 +233,12 @@ fn find_orphans(
 }
 
 #[tauri::command]
-pub async fn scan_orphans(app: AppHandle, include_retained: bool) -> Result<OrphanScan, AppError> {
+pub async fn scan_orphans(
+    app: AppHandle,
+    lock: State<'_, OperationLock>,
+    include_retained: bool,
+) -> Result<OrphanScan, AppError> {
+    let _guard = lock.try_acquire("an orphan scan")?;
     let store = RetainedAttachments::for_app(&app)?;
     blocking(move || scan_orphans_blocking(&store, include_retained)).await
 }
@@ -287,8 +294,10 @@ fn ensure_messages_not_running() -> Result<(), AppError> {
 #[tauri::command]
 pub async fn clean_orphans(
     app: AppHandle,
+    lock: State<'_, OperationLock>,
     args: CleanOrphansArgs,
 ) -> Result<OrphanCleanResult, AppError> {
+    let _guard = lock.try_acquire("a cleanup")?;
     let store = RetainedAttachments::for_app(&app)?;
     let snapshot_root = default_snapshot_root(&app, SnapshotKind::OrphanClean)?;
     blocking(move || clean_orphans_blocking(&store, &snapshot_root, &args)).await
@@ -515,12 +524,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (conn, root) = fixture(&tmp);
         let a = file(&root.join("ab/01/G/a.jpg"));
-        add_row(&conn, 1, &a, true); // relinked
+        add_row(&conn, 1, &a, true); // linked (e.g. a delete mid-commit): keep tracking
         add_row(&conn, 2, &a, false); // still kept & unlinked
         let retained = BTreeSet::from([1, 2, 99]); // 99 no longer exists
 
         let o = find_orphans(&conn, &retained, false, &[root], later()).unwrap();
-        assert_eq!(o.stale_retained, vec![1, 99]);
+        assert_eq!(o.stale_retained, vec![99]);
     }
 
     #[test]
