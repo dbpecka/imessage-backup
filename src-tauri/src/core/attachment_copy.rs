@@ -182,8 +182,8 @@ pub fn copy_attachments(
             }
             Err(e) => return summary.fail(&src, e),
         };
-        if !meta.is_file() {
-            return summary.fail(&src, "not a regular file");
+        if !meta.is_file() && !meta.is_dir() {
+            return summary.fail(&src, "not a regular file or folder");
         }
 
         let chat_dir = chat_id.map_or_else(|| "_orphaned".to_string(), |id| id.to_string());
@@ -197,37 +197,70 @@ pub fn copy_attachments(
                 return summary.fail(&src, e);
             }
         }
-        match fs::copy(&src, &dest) {
-            Ok(n) if n == meta.len() => {
-                // Keep the original date so the archive sorts by when the
-                // attachment was received, not when it was backed up.
-                if let Ok(modified) = meta.modified() {
-                    let set = fs::File::options()
-                        .write(true)
-                        .open(&dest)
-                        .and_then(|f| f.set_modified(modified));
-                    if let Err(e) = set {
-                        eprintln!("backup: couldn't keep date on {}: {e}", dest.display());
-                    }
-                }
+        // Some attachments (bundles) are folders; copy those whole.
+        let result = if meta.is_dir() {
+            copy_tree(&src, &dest).inspect_err(|_| {
+                let _ = fs::remove_dir_all(&dest);
+            })
+        } else {
+            copy_one_file(&src, &dest, &meta).inspect_err(|_| {
+                let _ = fs::remove_file(&dest);
+            })
+        };
+        match result {
+            Ok(n) => {
                 summary.copied += 1;
                 summary.bytes += n;
                 summary.copied_ids.push(i64::from(attachment.rowid));
                 copied.insert(attachment.rowid, rel);
             }
-            Ok(n) => {
-                let _ = fs::remove_file(&dest);
-                summary.fail(&src, format!("short copy ({n} of {} bytes)", meta.len()));
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&dest);
-                summary.fail(&src, e);
-            }
+            Err(why) => summary.fail(&src, why),
         }
     })?;
 
     progress.finish();
     Ok((summary, copied))
+}
+
+/// Copy one file, check the whole thing arrived, and keep its original
+/// modification date (so the archive sorts by when the attachment was
+/// received, not when it was backed up). Returns the bytes copied.
+fn copy_one_file(src: &Path, dest: &Path, meta: &fs::Metadata) -> Result<u64, String> {
+    let n = fs::copy(src, dest).map_err(|e| e.to_string())?;
+    if n != meta.len() {
+        return Err(format!("short copy ({n} of {} bytes)", meta.len()));
+    }
+    if let Ok(modified) = meta.modified() {
+        let set = fs::File::options()
+            .write(true)
+            .open(dest)
+            .and_then(|f| f.set_modified(modified));
+        if let Err(e) = set {
+            eprintln!("backup: couldn't keep date on {}: {e}", dest.display());
+        }
+    }
+    Ok(n)
+}
+
+/// Copy a folder attachment recursively. Symlinks inside it are skipped,
+/// never followed — the same rule [`source_size`] uses, so the sizes
+/// compare like for like.
+fn copy_tree(src: &Path, dest: &Path) -> Result<u64, String> {
+    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let mut total = 0u64;
+    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        let to = dest.join(entry.file_name());
+        if kind.is_dir() {
+            total += copy_tree(&entry.path(), &to)?;
+        } else if kind.is_file() {
+            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            total += copy_one_file(&entry.path(), &to, &meta)
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(total)
 }
 
 /// Sizes of what the runtime wrote, keyed by file stem (the rowid):

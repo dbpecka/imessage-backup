@@ -835,3 +835,39 @@ fn linked_file_directly_in_a_root_folder_is_kept() {
     assert_eq!(r.fs_files_removed, 0);
     assert!(f.exists());
 }
+
+#[test]
+fn folder_attachment_is_copied_whole_in_json_backups() {
+    let env = Env::new();
+    // A bundle-style attachment: a folder with nested files (and a symlink,
+    // which is skipped rather than followed).
+    let bundle = env.attachments.join("d1/01/GUID-D/Pass.pkpass");
+    fs::create_dir_all(bundle.join("en.lproj")).unwrap();
+    fs::write(bundle.join("pass.json"), b"{\"pass\":1}").unwrap();
+    fs::write(bundle.join("en.lproj/strings"), b"hello").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc/hosts", bundle.join("link")).unwrap();
+    env.add_attachment(30, &bundle, "application/vnd.apple.pkpass", Some(4));
+
+    let b = env.backup(chat(2), "json");
+    let copy = b.attachment_copy.as_ref().unwrap();
+    assert_eq!(copy.failed, 0, "{:?}", copy.failures);
+    assert!(b.includes_attachments);
+
+    let export = PathBuf::from(&b.export_path);
+    let copied = export.join("attachments/2/30-Pass.pkpass");
+    assert_eq!(fs::read(copied.join("pass.json")).unwrap(), b"{\"pass\":1}");
+    assert_eq!(fs::read(copied.join("en.lproj/strings")).unwrap(), b"hello");
+    assert!(!copied.join("link").exists(), "symlinks are not copied");
+    let ndjson: String = fs::read_dir(&export)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "ndjson"))
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(ndjson.contains("attachments/2/30-Pass.pkpass"), "{ndjson}");
+
+    // The backup now vouches for the folder, so the delete is verified.
+    let cov = coverage_now(&env.db, &env.receipts, &chat(2)).unwrap();
+    assert!(cov.with_attachments);
+}
