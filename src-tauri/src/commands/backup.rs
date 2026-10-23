@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::commands::delete::filter_content;
+use crate::core::attachment_copy::source_size;
 use crate::core::attachment_copy::{
     annotate_json_export, copy_attachments, verify_runtime_copies, CopySummary,
 };
@@ -27,6 +28,7 @@ use crate::core::op_lock::OperationLock;
 use crate::core::progress::TauriProgress;
 use crate::core::receipts::{BackupReceipts, ContentFingerprint};
 use crate::core::snapshot::create_unique_dir;
+use crate::core::space::{ensure_space, snapshot_size, SpaceProbe};
 use crate::error::AppError;
 
 /// Write the tapbacks in `ids` to `tapbacks-outside-filter.json`.
@@ -92,6 +94,30 @@ fn children_without_target(
         .collect())
 }
 
+/// Rough upper bound on what a backup will write: the attachment files to
+/// copy (their real sizes on disk) plus the exported text, estimated as
+/// twice the matched share of chat.db (HTML adds markup; chat.db's indexes
+/// make it a generous base), at least 10 MB.
+fn estimate_backup_size(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    plan: &imessage_database::tables::write::delete::DeletePlan,
+    copy: bool,
+) -> Result<u64, AppError> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))?;
+    let share = plan.message_rowids.len() as f64 / (total.max(1) as f64);
+    let text = ((snapshot_size(db_path) as f64) * share.min(1.0) * 2.0) as u64;
+    let files: u64 = if copy {
+        plan.attachment_files_on_disk
+            .iter()
+            .filter_map(|p| source_size(p))
+            .sum()
+    } else {
+        0
+    };
+    Ok(files + text.max(10 * 1024 * 1024))
+}
+
 fn count(r: Result<i64, imessage_database::error::table::TableError>) -> Result<u64, AppError> {
     r.map(|n| n.max(0) as u64)
         .map_err(|e| AppError::Other(e.to_string()))
@@ -148,7 +174,16 @@ pub async fn run_backup(
     let db_path = default_chat_db_path()?;
     let receipts = Arc::clone(&receipts);
     let progress = TauriProgress::new(app.clone(), BACKUP_PROGRESS_EVENT);
-    blocking(move || backup_now(&db_path, &receipts, args, &progress)).await
+    blocking(move || {
+        backup_now(
+            &db_path,
+            &receipts,
+            args,
+            &progress,
+            crate::core::space::system_available,
+        )
+    })
+    .await
 }
 
 /// The whole backup as a plain function (see [`run_backup`]): export,
@@ -158,6 +193,7 @@ pub(crate) fn backup_now(
     receipts: &BackupReceipts,
     args: RunBackupArgs,
     progress: &dyn ProgressReporter,
+    space: SpaceProbe,
 ) -> Result<BackupResult, AppError> {
     let format = ExportType::from_cli(&args.format)
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
@@ -172,11 +208,20 @@ pub(crate) fn backup_now(
     // Fingerprint what the filter matches *before* exporting. Anything
     // that arrives during or after the run changes the fingerprint, so
     // this backup can never vouch for messages it might not contain.
-    let (content, planned_attachments, reaction_ids) = {
+    let (content, planned_attachments, reaction_ids, estimate) = {
         let conn = open_read(&db_path)?;
         let fc = filter_content(&conn, &query, &db_path)?;
-        (fc.content, fc.plan.attachment_rowids, fc.reaction_ids)
+        let estimate = estimate_backup_size(&conn, &db_path, &fc.plan, copy)?;
+        (
+            fc.content,
+            fc.plan.attachment_rowids,
+            fc.reaction_ids,
+            estimate,
+        )
     };
+    // Refuse up front rather than leave a half-written backup on a full
+    // drive.
+    ensure_space(&destination, estimate, "this backup", space)?;
 
     // Every run gets its own folder: the JSON exporter appends to
     // existing files (re-running into the same folder duplicated every

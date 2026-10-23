@@ -14,3 +14,4 @@ pub mod progress;
 pub mod receipts;
 pub mod retained;
 pub mod snapshot;
+pub mod space;

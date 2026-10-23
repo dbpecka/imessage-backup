@@ -467,6 +467,12 @@ pub(crate) fn clean_orphans_blocking(
     // keep its file too.
     let mut deleted: HashSet<i64> = HashSet::new();
     if !orphans.db.is_empty() {
+        crate::core::space::ensure_space(
+            snapshot_root,
+            crate::core::space::snapshot_size(&db_path),
+            "the safety snapshot",
+            probe.available_space,
+        )?;
         checkpoint_wal(&db_path)?;
         let snapshot = snapshot_chat_db(&db_path, snapshot_root)?;
 
