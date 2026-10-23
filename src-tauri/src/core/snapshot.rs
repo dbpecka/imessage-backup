@@ -139,33 +139,53 @@ pub const SNAPSHOTS_TO_KEEP: usize = 5;
 /// folders this module created (timestamp-named, containing `chat.db`) are
 /// considered. Returns how many were removed; failures are logged and
 /// skipped since pruning is housekeeping, not part of the safety contract.
-pub fn prune_snapshots(root: &Path, keep: usize) -> usize {
+pub fn prune_snapshots(root: &Path, keep: usize, just_taken: &Path) -> usize {
     let Ok(entries) = fs::read_dir(root) else {
         return 0;
     };
-    let mut dirs: Vec<PathBuf> = entries
+    let mut dirs: Vec<(SortKey, PathBuf)> = entries
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_snapshot_name)
-                && p.join("chat.db").is_file()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let suffix = snapshot_suffix(&name)?;
+            // Order by when the snapshot was actually written, not by its
+            // name: names are local time, so after a DST fall-back or a
+            // westward time-zone change a newer snapshot can sort as older.
+            let written = fs::metadata(p.join("chat.db")).ok()?.modified().ok()?;
+            Some(((written, name[..19].to_string(), suffix), p))
         })
         .collect();
-    // Names are `YYYY-MM-DDTHH-MM-SS` with an optional `-N` suffix, so a
-    // lexicographic sort is chronological.
     dirs.sort();
     let excess = dirs.len().saturating_sub(keep);
     let mut removed = 0;
-    for dir in dirs.into_iter().take(excess) {
+    for (_, dir) in dirs.into_iter().take(excess) {
+        // Never prune the snapshot protecting the operation in progress.
+        if dir == just_taken {
+            continue;
+        }
         match fs::remove_dir_all(&dir) {
             Ok(()) => removed += 1,
             Err(e) => eprintln!("snapshot: failed to prune {}: {e}", dir.display()),
         }
     }
     removed
+}
+
+/// (write time, timestamp part of the name, numeric `-N` suffix).
+type SortKey = (std::time::SystemTime, String, u32);
+
+/// For a snapshot folder name (`YYYY-MM-DDTHH-MM-SS` plus an optional
+/// `-N`), the numeric suffix (0 if none); `None` for other names.
+fn snapshot_suffix(name: &str) -> Option<u32> {
+    if !is_snapshot_name(name) {
+        return None;
+    }
+    match name.get(19..) {
+        Some("") | None => Some(0),
+        Some(rest) => rest.strip_prefix('-')?.parse().ok(),
+    }
 }
 
 fn is_snapshot_name(name: &str) -> bool {
@@ -273,13 +293,60 @@ mod tests {
         fs::write(root.join("my-notes/chat.db"), b"x").unwrap();
         fs::create_dir_all(root.join("2020-01-01T00-00-00")).unwrap();
 
-        assert_eq!(prune_snapshots(root, 2), 2);
+        assert_eq!(
+            prune_snapshots(root, 2, &root.join("2025-06-01T00-00-00")),
+            2
+        );
         assert!(!root.join("2024-01-01T10-00-00").exists());
         assert!(!root.join("2024-01-01T10-00-00-1").exists());
         assert!(root.join("2024-01-02T09-00-00").exists());
         assert!(root.join("2025-06-01T00-00-00").exists());
         assert!(root.join("my-notes").exists());
         assert!(root.join("2020-01-01T00-00-00").exists());
+    }
+
+    #[test]
+    fn prune_orders_by_write_time_and_spares_the_new_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        // Taken in this order, but the clock went back an hour before the
+        // last one (DST fall-back), so its name sorts first.
+        let taken = [
+            "2024-11-03T01-10-00",
+            "2024-11-03T01-20-00",
+            "2024-11-03T01-30-00",
+            "2024-11-03T01-05-00",
+        ];
+        for (i, n) in taken.iter().enumerate() {
+            let db = root.join(n).join("chat.db");
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::write(&db, b"x").unwrap();
+            let f = fs::File::options().write(true).open(&db).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i as u64 * 60))
+                .unwrap();
+        }
+        let newest = root.join("2024-11-03T01-05-00");
+
+        assert_eq!(prune_snapshots(root, 2, &newest), 2);
+        assert!(newest.exists(), "the snapshot just taken survives");
+        assert!(root.join("2024-11-03T01-30-00").exists());
+        assert!(!root.join("2024-11-03T01-10-00").exists());
+        assert!(!root.join("2024-11-03T01-20-00").exists());
+
+        // Even with keep = 0 the just-taken snapshot is never removed.
+        assert_eq!(prune_snapshots(root, 0, &newest), 1);
+        assert!(newest.exists());
+    }
+
+    #[test]
+    fn numeric_suffixes_sort_numerically() {
+        assert_eq!(snapshot_suffix("2024-01-01T00-00-00"), Some(0));
+        assert_eq!(snapshot_suffix("2024-01-01T00-00-00-10"), Some(10));
+        assert!(
+            snapshot_suffix("2024-01-01T00-00-00-2") < snapshot_suffix("2024-01-01T00-00-00-10")
+        );
+        assert_eq!(snapshot_suffix("notes"), None);
     }
 
     #[test]

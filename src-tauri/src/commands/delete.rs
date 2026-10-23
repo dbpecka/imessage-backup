@@ -20,7 +20,6 @@ use crate::core::icloud::{detect_icloud_messages, ICloudState};
 use crate::core::messages_app::is_messages_running;
 use crate::core::op_lock::OperationLock;
 use crate::core::receipts::{BackupReceipts, ContentFingerprint, Coverage};
-use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
     checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
     SNAPSHOTS_TO_KEEP,
@@ -32,19 +31,21 @@ pub const DELETE_CONFIRMATION_PHRASE: &str = "DELETE";
 /// Apply a `DeleteScope` to a freshly-computed plan, zeroing out the parts
 /// the caller wants to keep. Pulled out of `run_delete` so the slicing
 /// logic is covered by unit tests without needing a real chat.db.
-pub(crate) fn apply_scope(plan: &mut DeletePlan, scope: &DeleteScope) {
+pub(crate) fn apply_scope(plan: &mut DeletePlan, scope: &DeleteScope) -> Result<(), AppError> {
     match scope {
-        DeleteScope::MessagesOnly => {
-            // Keep attachment records and files on disk; only remove messages.
-            plan.attachment_rowids.clear();
-            plan.attachment_files_on_disk.clear();
-            plan.attachment_bytes = 0;
-        }
+        DeleteScope::MessagesOnly => Err(AppError::Other(
+            "Deleting messages while keeping their attachments isn't possible: chat.db's own \
+             triggers delete an attachment's record as soon as its last message is gone, which \
+             would leave the files untracked. Delete messages together with their attachments, \
+             or attachments only."
+                .into(),
+        )),
         DeleteScope::AttachmentsOnly => {
             // Keep messages; only remove attachment records and files.
             plan.message_rowids.clear();
+            Ok(())
         }
-        DeleteScope::Both => {}
+        DeleteScope::Both => Ok(()),
     }
 }
 
@@ -111,12 +112,14 @@ pub(crate) fn exclude_shared_attachments(
     Ok(())
 }
 
-/// What actually happens to a direct chat.db edit on an iCloud-synced
-/// account. Bubble Wrap bypasses Messages' own sync bookkeeping, so the
-/// delete is neither reliably propagated nor protected from re-download.
-const ICLOUD_RISK: &str = "Bubble Wrap edits this Mac's Messages database directly, which \
-    Messages in iCloud doesn't track: the delete may not reach your other devices, and deleted \
-    messages may be downloaded to this Mac again from iCloud.";
+/// What a delete means on an iCloud-synced account. chat.db's own delete
+/// triggers record every removed message and attachment in
+/// `sync_deleted_messages` / `sync_deleted_attachments` — the queue Messages
+/// uses to push deletions to iCloud — so the delete is expected to reach the
+/// user's other devices the next time Messages syncs.
+const ICLOUD_RISK: &str = "Deleting here records each deletion for Messages in iCloud, so when \
+    Messages next syncs, these messages and attachments are expected to be deleted from iCloud \
+    and your other devices too — not just this Mac.";
 
 /// Extract the target message guid from an `associated_message_guid`
 /// (`p:0/<guid>`, `bp:<guid>`, or a bare guid).
@@ -143,9 +146,9 @@ fn is_missing_column(e: &rusqlite::Error) -> bool {
 pub(crate) fn add_orphaned_reactions(
     conn: &Connection,
     plan: &mut DeletePlan,
-) -> Result<u64, AppError> {
+) -> Result<Vec<i64>, AppError> {
     if plan.message_rowids.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let mut guids: HashSet<String> = HashSet::new();
     for chunk in plan.message_rowids.chunks(800) {
@@ -167,17 +170,17 @@ pub(crate) fn add_orphaned_reactions(
     let mut stmt = match stmt {
         Ok(s) => s,
         // Very old (or test) schemas don't track reactions this way.
-        Err(e) if is_missing_column(&e) => return Ok(0),
+        Err(e) if is_missing_column(&e) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     let planned: HashSet<i64> = plan.message_rowids.iter().copied().collect();
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-    let mut added = 0u64;
+    let mut added = Vec::new();
     for row in rows {
         let (rowid, associated) = row?;
         if !planned.contains(&rowid) && guids.contains(reaction_target(&associated)) {
             plan.message_rowids.push(rowid);
-            added += 1;
+            added.push(rowid);
         }
     }
     plan.message_rowids.sort_unstable();
@@ -260,27 +263,68 @@ pub(crate) fn count_not_on_mac(conn: &Connection, plan: &DeletePlan) -> Result<u
 
 /// The full (unscoped) plan for `ctx`, shared by the preview and the delete
 /// so the counts the user confirms are the counts that get deleted.
+/// What a filter matches, in the form a backup records and a delete
+/// checks: the filter's messages and attachments plus the tapbacks (outside
+/// the filter) that deleting those messages would also remove.
+pub(crate) struct FilterContent {
+    /// The library plan with the tapbacks added; shared attachments not yet
+    /// excluded.
+    pub plan: DeletePlan,
+    pub reaction_ids: Vec<i64>,
+    /// Everything that would be deleted or backed up.
+    pub content: ContentFingerprint,
+    /// Which of the matched attachments have their file on this Mac right
+    /// now. A backup only protects the files that were present (and copied)
+    /// when it ran; anything downloaded afterwards changes this.
+    pub present: ContentFingerprint,
+}
+
+/// Attachment ids (of `ids`) whose file is on this Mac.
+pub(crate) fn present_attachments(conn: &Connection, ids: &[i64]) -> Result<Vec<i64>, AppError> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT ROWID, filename FROM attachment WHERE ROWID IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, f) = row?;
+            if f.is_some_and(|f| expand_tilde(&f).exists()) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn filter_content(
+    conn: &Connection,
+    ctx: &QueryContext,
+    db_path: &std::path::Path,
+) -> Result<FilterContent, AppError> {
+    let mut plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
+        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    let reaction_ids = add_orphaned_reactions(conn, &mut plan)?;
+    let content = ContentFingerprint::of(&plan.message_rowids, &plan.attachment_rowids);
+    let present = ContentFingerprint::of(&[], &present_attachments(conn, &plan.attachment_rowids)?);
+    Ok(FilterContent {
+        plan,
+        reaction_ids,
+        content,
+        present,
+    })
+}
+
 pub(crate) struct BuiltPlan {
     pub plan: DeletePlan,
     /// Tapbacks outside the filter added because their target message is
     /// being deleted.
     pub reactions: u64,
-    /// What the filter itself matches (before tapbacks are added or shared
-    /// attachments removed) — the same thing a backup of this filter
-    /// records, so the two can be compared.
     pub content: ContentFingerprint,
-}
-
-/// What `ctx` matches, as recorded by a backup and checked by a delete.
-pub(crate) fn filter_content(
-    conn: &Connection,
-    ctx: &QueryContext,
-    db_path: &std::path::Path,
-) -> Result<(DeletePlan, ContentFingerprint), AppError> {
-    let plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
-        .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
-    let content = ContentFingerprint::of(&plan.message_rowids, &plan.attachment_rowids);
-    Ok((plan, content))
+    pub present: ContentFingerprint,
 }
 
 pub(crate) fn build_plan(
@@ -288,13 +332,18 @@ pub(crate) fn build_plan(
     ctx: &QueryContext,
     db_path: &std::path::Path,
 ) -> Result<BuiltPlan, AppError> {
-    let (mut plan, content) = filter_content(conn, ctx, db_path)?;
-    let reactions = add_orphaned_reactions(conn, &mut plan)?;
+    let FilterContent {
+        mut plan,
+        reaction_ids,
+        content,
+        present,
+    } = filter_content(conn, ctx, db_path)?;
     exclude_shared_attachments(conn, &mut plan)?;
     Ok(BuiltPlan {
         plan,
-        reactions,
+        reactions: reaction_ids.len() as u64,
         content,
+        present,
     })
 }
 
@@ -342,8 +391,10 @@ pub enum DeleteScope {
     /// Delete both messages and their attachment records/files (default).
     #[default]
     Both,
-    /// Delete message rows and join tables only; leave attachment records
-    /// and files on disk untouched.
+    /// No longer supported (always refused): chat.db's triggers delete an
+    /// attachment's record when its last message link goes, so attachments
+    /// can't be kept without their messages. Kept on the wire so an old
+    /// caller gets a clear error rather than a parse failure.
     MessagesOnly,
     /// Delete attachment records and files only; leave message rows intact
     /// so conversation history is preserved.
@@ -460,10 +511,11 @@ pub async fn backup_coverage(
     let ctx = filter.to_query_context()?;
     let content = blocking(move || {
         let conn = open_read(&db_path)?;
-        Ok(filter_content(&conn, &ctx, &db_path)?.1)
+        let fc = filter_content(&conn, &ctx, &db_path)?;
+        Ok((fc.content, fc.present))
     })
     .await?;
-    Ok(receipts.coverage(&filter.key(), &content))
+    Ok(receipts.coverage(&filter.key(), &content.0, &content.1))
 }
 
 fn ensure_messages_not_running() -> Result<(), AppError> {
@@ -483,10 +535,10 @@ struct Prepared {
     /// The scoped plan.
     plan: DeletePlan,
     scope: DeleteScope,
-    /// What the filter matches, for the backup gate.
+    /// What the filter matches, and which attachment files are present,
+    /// for the backup gate.
     content: ContentFingerprint,
-    /// Attachments a messages-only delete keeps (and must protect).
-    keep_attachments: Vec<i64>,
+    present: ContentFingerprint,
     /// Messages whose attachment flag may need clearing afterwards.
     flag_candidates: Vec<i64>,
     not_on_mac: u64,
@@ -503,19 +555,13 @@ fn prepare_delete(
     // two writers, and the read-only path is more conservative.
     let conn = open_read(db_path)?;
     let BuiltPlan {
-        mut plan, content, ..
+        mut plan,
+        content,
+        present,
+        ..
     } = build_plan(&conn, ctx, db_path)?;
 
-    // A messages-only delete also drops the message_attachment_join rows,
-    // leaving the kept attachments unlinked; the orphan cleaner must skip
-    // them.
-    let keep_attachments = if matches!(scope, DeleteScope::MessagesOnly) {
-        plan.attachment_rowids.clone()
-    } else {
-        Vec::new()
-    };
-
-    apply_scope(&mut plan, scope);
+    apply_scope(&mut plan, scope)?;
 
     // Gate 3: the plan must match what the user confirmed.
     check_expected_counts(&plan, expected_messages, expected_attachments)?;
@@ -530,7 +576,7 @@ fn prepare_delete(
         plan,
         scope: *scope,
         content,
-        keep_attachments,
+        present,
         flag_candidates,
         not_on_mac,
     })
@@ -591,8 +637,6 @@ pub async fn run_delete(
         ),
         _ => (default_snapshot_root(&app, SnapshotKind::Delete)?, true),
     };
-    let retained = RetainedAttachments::for_app(&app)?;
-
     let filter_key = args.filter.key();
     let scope = args.delete_scope;
     let expected = (args.expected_message_count, args.expected_attachment_count);
@@ -601,7 +645,7 @@ pub async fn run_delete(
     // Gate 3b: backup gate, against the exact content being deleted — a
     // backup of the same filter taken before newer messages arrived doesn't
     // cover them.
-    let coverage = receipts.coverage(&filter_key, &prepared.content);
+    let coverage = receipts.coverage(&filter_key, &prepared.content, &prepared.present);
     let backup_verified =
         check_backup_gate(&coverage, &prepared.scope, args.acknowledge_skip_backup)?;
 
@@ -620,7 +664,6 @@ pub async fn run_delete(
     blocking(move || {
         let Prepared {
             plan,
-            keep_attachments,
             flag_candidates,
             ..
         } = prepared;
@@ -631,26 +674,18 @@ pub async fn run_delete(
         if managed_root {
             // Only ever prune the folder we own; a caller-chosen root is
             // theirs.
-            prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP);
+            prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
         }
 
         // Re-check right before writing: the snapshot of a large chat.db
         // can take long enough for the user to reopen Messages.
         ensure_messages_not_running()?;
 
-        // Record kept attachments before the transaction (so a crash after
-        // commit can't leave them unprotected) and roll the record back if
-        // the transaction fails.
-        let newly_retained = retained.add(&keep_attachments)?;
-
         // Now execute against a writable connection.
         let mut write_conn = open_write(&db_path)?;
         let report = match execute_delete(&mut write_conn, &plan) {
             Ok(r) => r,
             Err(e) => {
-                if let Err(re) = retained.remove(&newly_retained) {
-                    eprintln!("delete: failed to roll back retained attachment list: {re:?}");
-                }
                 return Err(AppError::Database(format!(
                     "delete transaction failed (rolled back; no changes made): {e}"
                 )));
@@ -721,7 +756,9 @@ mod tests {
                 service TEXT,
                 handle_id INTEGER,
                 date INTEGER NOT NULL,
-                is_from_me INTEGER DEFAULT 0
+                is_from_me INTEGER DEFAULT 0,
+                ck_record_id TEXT,
+                balloon_bundle_id TEXT
             );
             CREATE TABLE chat (
                 ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -742,7 +779,9 @@ mod tests {
                 transfer_name TEXT,
                 uti TEXT,
                 is_sticker INTEGER DEFAULT 0,
-                hide_attachment INTEGER DEFAULT 0
+                hide_attachment INTEGER DEFAULT 0,
+                guid TEXT,
+                ck_record_id TEXT
             );
             CREATE TABLE chat_message_join (
                 chat_id INTEGER NOT NULL,
@@ -750,15 +789,48 @@ mod tests {
                 PRIMARY KEY (chat_id, message_id)
             );
             CREATE TABLE message_attachment_join (
-                message_id INTEGER NOT NULL,
-                attachment_id INTEGER NOT NULL,
-                PRIMARY KEY (message_id, attachment_id)
+                message_id INTEGER REFERENCES message (ROWID) ON DELETE CASCADE,
+                attachment_id INTEGER REFERENCES attachment (ROWID) ON DELETE CASCADE,
+                UNIQUE (message_id, attachment_id)
             );
             CREATE TABLE chat_handle_join (
                 chat_id INTEGER NOT NULL,
                 handle_id INTEGER NOT NULL,
                 PRIMARY KEY (chat_id, handle_id)
-            );",
+            );
+            -- Apple's own bookkeeping and triggers (copied from a real
+            -- chat.db). They change what a delete actually does, so tests
+            -- must run with them.
+            CREATE TABLE sync_deleted_messages (guid TEXT, recordID TEXT);
+            CREATE TABLE sync_deleted_attachments (guid TEXT, recordID TEXT);
+            CREATE TABLE deleted_messages (guid TEXT);
+            CREATE TRIGGER after_delete_on_message_attachment_join
+              AFTER DELETE ON message_attachment_join BEGIN
+                DELETE FROM attachment WHERE attachment.ROWID = OLD.attachment_id
+                  AND (SELECT 1 FROM message_attachment_join
+                       WHERE attachment_id = OLD.attachment_id LIMIT 1) IS NULL;
+              END;
+            CREATE TRIGGER before_delete_on_attachment BEFORE DELETE ON attachment BEGIN
+                SELECT before_delete_attachment_path(OLD.ROWID, OLD.guid);
+              END;
+            CREATE TRIGGER after_delete_on_attachment AFTER DELETE ON attachment BEGIN
+                SELECT delete_attachment_path(OLD.filename);
+              END;
+            CREATE TRIGGER add_to_sync_deleted_attachments AFTER DELETE ON attachment BEGIN
+                INSERT INTO sync_deleted_attachments (guid, recordID)
+                  VALUES (OLD.guid, OLD.ck_record_id);
+              END;
+            CREATE TRIGGER add_to_sync_deleted_messages AFTER DELETE ON message BEGIN
+                INSERT INTO sync_deleted_messages (guid, recordID)
+                  VALUES (OLD.guid, OLD.ck_record_id);
+              END;
+            CREATE TRIGGER add_to_deleted_messages AFTER DELETE ON message BEGIN
+                INSERT INTO deleted_messages (guid) VALUES (OLD.guid);
+              END;
+            CREATE TRIGGER after_delete_on_message_plugin AFTER DELETE ON message
+              WHEN OLD.balloon_bundle_id IS NOT NULL BEGIN
+                SELECT after_delete_message_plugin(OLD.ROWID, OLD.guid);
+              END;",
         )
         .unwrap();
     }
@@ -794,6 +866,12 @@ mod tests {
         att_path
     }
 
+    /// How the app opens chat.db for writing: foreign keys on and Apple's
+    /// trigger functions stubbed, so cascades and triggers behave for real.
+    fn writable(db_path: &std::path::Path) -> Connection {
+        crate::core::db_path::open_write(db_path).unwrap()
+    }
+
     fn fresh_fixture() -> (TempDir, PathBuf, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("chat.db");
@@ -805,19 +883,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_scope_messages_only_keeps_attachments() {
+    fn messages_only_scope_is_refused() {
         let mut plan = DeletePlan {
             message_rowids: vec![1, 2],
             attachment_rowids: vec![10],
-            attachment_files_on_disk: vec![PathBuf::from("/tmp/x.jpg")],
-            attachment_bytes: 1024,
-            cleanup_orphans: true,
+            ..Default::default()
         };
-        apply_scope(&mut plan, &DeleteScope::MessagesOnly);
-        assert_eq!(plan.message_rowids, vec![1, 2]);
-        assert!(plan.attachment_rowids.is_empty());
-        assert!(plan.attachment_files_on_disk.is_empty());
-        assert_eq!(plan.attachment_bytes, 0);
+        let err = apply_scope(&mut plan, &DeleteScope::MessagesOnly).unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("isn't possible")));
     }
 
     #[test]
@@ -829,7 +902,7 @@ mod tests {
             attachment_bytes: 1024,
             cleanup_orphans: true,
         };
-        apply_scope(&mut plan, &DeleteScope::AttachmentsOnly);
+        apply_scope(&mut plan, &DeleteScope::AttachmentsOnly).unwrap();
         assert!(plan.message_rowids.is_empty());
         assert_eq!(plan.attachment_rowids, vec![10]);
         assert_eq!(plan.attachment_files_on_disk.len(), 1);
@@ -846,7 +919,7 @@ mod tests {
             cleanup_orphans: true,
         };
         let mut plan = original.clone();
-        apply_scope(&mut plan, &DeleteScope::Both);
+        apply_scope(&mut plan, &DeleteScope::Both).unwrap();
         assert_eq!(plan.message_rowids, original.message_rowids);
         assert_eq!(plan.attachment_rowids, original.attachment_rowids);
         assert_eq!(plan.attachment_bytes, original.attachment_bytes);
@@ -881,16 +954,22 @@ mod tests {
     #[test]
     fn backup_stops_covering_once_new_messages_match_the_filter() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         let backup_dir = tempfile::TempDir::new().unwrap();
         let receipts = BackupReceipts::default();
         let filter = FilterSpec::default();
         let ctx = filter.to_query_context().unwrap();
 
-        let (_, at_backup) = filter_content(&conn, &ctx, &db_path).unwrap();
-        receipts.record(filter.key(), at_backup, true, backup_dir.path());
-        let content = build_plan(&conn, &ctx, &db_path).unwrap().content;
-        assert!(receipts.coverage(&filter.key(), &content).with_attachments);
+        // Back up: attachment 1's file is on the Mac and gets copied.
+        let fc = filter_content(&conn, &ctx, &db_path).unwrap();
+        let copied = ContentFingerprint::of(&[], &[1]);
+        receipts.record(filter.key(), fc.content, copied, true, backup_dir.path());
+        let p = build_plan(&conn, &ctx, &db_path).unwrap();
+        assert!(
+            receipts
+                .coverage(&filter.key(), &p.content, &p.present)
+                .with_attachments
+        );
 
         // A message arrives after the backup; same filter, new content.
         conn.execute_batch(
@@ -898,14 +977,85 @@ mod tests {
              INSERT INTO chat_message_join VALUES (1, 3);",
         )
         .unwrap();
-        let content = build_plan(&conn, &ctx, &db_path).unwrap().content;
-        assert!(!receipts.coverage(&filter.key(), &content).covered);
+        let p = build_plan(&conn, &ctx, &db_path).unwrap();
+        assert!(
+            !receipts
+                .coverage(&filter.key(), &p.content, &p.present)
+                .covered
+        );
+    }
+
+    #[test]
+    fn attachment_downloaded_after_backup_is_not_covered() {
+        let (tmp, db_path, _att) = fresh_fixture();
+        let conn = writable(&db_path);
+        let offloaded = tmp.path().join("offloaded.jpg");
+        conn.execute(
+            "INSERT INTO attachment (ROWID, filename) VALUES (2, ?1)",
+            params![offloaded.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO message_attachment_join VALUES (1, 2)", [])
+            .unwrap();
+        let backup_dir = tempfile::TempDir::new().unwrap();
+        let receipts = BackupReceipts::default();
+        let filter = FilterSpec::default();
+        let ctx = filter.to_query_context().unwrap();
+
+        // Backup copies attachment 1; attachment 2 is still in iCloud.
+        let fc = filter_content(&conn, &ctx, &db_path).unwrap();
+        receipts.record(
+            filter.key(),
+            fc.content,
+            ContentFingerprint::of(&[], &[1]),
+            true,
+            backup_dir.path(),
+        );
+        let p = build_plan(&conn, &ctx, &db_path).unwrap();
+        assert!(
+            receipts
+                .coverage(&filter.key(), &p.content, &p.present)
+                .with_attachments
+        );
+
+        // The user downloads it; the backup doesn't have it.
+        std::fs::write(&offloaded, b"now here").unwrap();
+        let p = build_plan(&conn, &ctx, &db_path).unwrap();
+        let c = receipts.coverage(&filter.key(), &p.content, &p.present);
+        assert!(c.covered && !c.with_attachments);
+    }
+
+    #[test]
+    fn late_tapback_on_an_in_range_message_breaks_coverage() {
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let conn = writable(&db_path);
+        conn.execute_batch(
+            "ALTER TABLE message ADD COLUMN associated_message_guid TEXT;
+             ALTER TABLE message ADD COLUMN associated_message_type INTEGER DEFAULT 0;
+             ALTER TABLE message ADD COLUMN cache_has_attachments INTEGER DEFAULT 0;
+             INSERT INTO chat (ROWID, chat_identifier) VALUES (2, 'other');",
+        )
+        .unwrap();
+        let mut ctx = QueryContext::default();
+        ctx.set_selected_chat_ids(std::collections::BTreeSet::from([1]));
+        let at_backup = filter_content(&conn, &ctx, &db_path).unwrap().content;
+
+        // Someone reacts later, from a chat outside the filter.
+        conn.execute_batch(
+            "INSERT INTO message (ROWID, guid, date, associated_message_guid, associated_message_type)
+               VALUES (10, 'r1', 0, 'p:0/g1', 2000);
+             INSERT INTO chat_message_join VALUES (2, 10);",
+        )
+        .unwrap();
+        let now = filter_content(&conn, &ctx, &db_path).unwrap();
+        assert_eq!(now.reaction_ids, vec![10]);
+        assert_ne!(now.content, at_backup);
     }
 
     #[test]
     fn shared_attachments_and_files_are_excluded_from_plan() {
         let (tmp, db_path, att1) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         // Message 3 lives in another chat and is NOT being deleted.
         let shared_file = tmp.path().join("shared.jpg");
         std::fs::write(&shared_file, b"x").unwrap();
@@ -948,7 +1098,7 @@ mod tests {
     #[test]
     fn attachments_only_delete_clears_stale_flags() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let mut conn = Connection::open(&db_path).unwrap();
+        let mut conn = writable(&db_path);
         conn.execute_batch(
             "ALTER TABLE message ADD COLUMN cache_has_attachments INTEGER DEFAULT 0;
              UPDATE message SET cache_has_attachments = 1 WHERE ROWID = 2;
@@ -993,7 +1143,7 @@ mod tests {
     #[test]
     fn tapbacks_on_deleted_messages_are_deleted_too() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         conn.execute_batch(
             "ALTER TABLE message ADD COLUMN associated_message_guid TEXT;
              ALTER TABLE message ADD COLUMN associated_message_type INTEGER DEFAULT 0;
@@ -1028,7 +1178,7 @@ mod tests {
     #[test]
     fn reactions_are_skipped_on_schemas_without_them() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         let plan = build_plan(&conn, &QueryContext::default(), &db_path)
             .unwrap()
             .plan;
@@ -1038,7 +1188,7 @@ mod tests {
     #[test]
     fn not_on_mac_counts_missing_files_only() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         conn.execute_batch(
             "INSERT INTO attachment (ROWID, filename) VALUES (2, '/nowhere/offloaded.jpg'), (3, NULL);
              INSERT INTO message_attachment_join VALUES (1, 2), (1, 3);",
@@ -1068,7 +1218,7 @@ mod tests {
     #[test]
     fn preview_on_fixture_counts_all_messages() {
         let (_tmp, db_path, _att) = fresh_fixture();
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = writable(&db_path);
         let ctx = QueryContext::default();
         let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         assert_eq!(plan.message_rowids.len(), 2);
@@ -1081,7 +1231,7 @@ mod tests {
         let (tmp, db_path, att) = fresh_fixture();
         assert!(att.exists());
 
-        let mut conn = Connection::open(&db_path).unwrap();
+        let mut conn = writable(&db_path);
         let ctx = QueryContext::default();
         let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         let report = execute_delete(&mut conn, &plan).unwrap();
@@ -1108,27 +1258,27 @@ mod tests {
     }
 
     #[test]
-    fn scoped_messages_only_delete_leaves_attachment_rows_and_file_intact() {
-        let (tmp, db_path, att) = fresh_fixture();
-        let mut conn = Connection::open(&db_path).unwrap();
-        let ctx = QueryContext::default();
-        let mut plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
-        apply_scope(&mut plan, &DeleteScope::MessagesOnly);
+    fn deleting_messages_takes_their_attachment_records_with_them() {
+        // Why "messages only" was removed: with chat.db's real triggers,
+        // removing a message's last link deletes the attachment record.
+        let (_tmp, db_path, _att) = fresh_fixture();
+        let mut conn = writable(&db_path);
+        let plan = DeletePlan {
+            message_rowids: vec![1, 2],
+            ..Default::default()
+        };
         execute_delete(&mut conn, &plan).unwrap();
-
-        // Messages gone…
-        let n_msg: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n_msg, 0);
-        // …but attachment row and file survive.
         let n_att: i64 = conn
             .query_row("SELECT COUNT(*) FROM attachment", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_att, 1);
-        assert!(att.exists());
-
-        drop(tmp);
+        assert_eq!(n_att, 0);
+        // …and every deletion is queued for iCloud sync.
+        let synced: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_deleted_messages", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(synced, 2);
     }
 
     #[test]
@@ -1139,7 +1289,7 @@ mod tests {
         let snap = crate::core::snapshot::snapshot_chat_db(&db_path, &snap_root).unwrap();
 
         // Execute the delete on the source db.
-        let mut conn = Connection::open(&db_path).unwrap();
+        let mut conn = writable(&db_path);
         let ctx = QueryContext::default();
         let plan = lib_preview_delete(&conn, &ctx, &AttachmentFilter::any(), &db_path).unwrap();
         execute_delete(&mut conn, &plan).unwrap();

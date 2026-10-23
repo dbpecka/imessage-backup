@@ -63,6 +63,10 @@ impl RetainedAttachments {
     /// Merge `ids` into the persisted set and return the ones that weren't
     /// already in it, so a caller can undo exactly its own addition with
     /// [`Self::remove`].
+    // Nothing adds ids any more: "messages only" deletes were removed
+    // because chat.db's triggers delete the attachment records anyway. The
+    // list is still read so ids saved by earlier builds keep working.
+    #[cfg(test)]
     pub fn add(&self, ids: &[i64]) -> Result<Vec<i64>, AppError> {
         let mut set = self.load()?;
         let added: Vec<i64> = ids.iter().copied().filter(|id| set.insert(*id)).collect();

@@ -81,12 +81,8 @@ export type ContactSummary = {
 export type FilterSpec = {
   dateRange?: { start?: string; end?: string };
   chatIds?: number[];
-  handleIds?: number[];
-  attachments?: {
-    types?: ('image' | 'video' | 'audio' | 'other')[];
-    minBytes?: number;
-    maxBytes?: number;
-  };
+  // Contact (handle) and attachment-type filters aren't applied by the
+  // backend yet; it rejects them rather than silently widening a delete.
 };
 
 export type BackupPreview = {
@@ -162,7 +158,8 @@ export type DeletePreview = {
   reactionCount: number;
 };
 
-export type DeleteScope = 'both' | 'messages_only' | 'attachments_only';
+/** Deleting messages always deletes their attachments (chat.db's triggers do it). */
+export type DeleteScope = 'both' | 'attachments_only';
 
 export type RunDeleteArgs = {
   filter: FilterSpec;
