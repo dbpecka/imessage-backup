@@ -59,24 +59,23 @@ Committed files that shouldn't be: `errors.txt`, `.idea/`, `public/.idea/`,
 `BubbleWrap.xcodeproj/project.xcworkspace/xcuserdata/`. Remove them and add
 to `.gitignore` so local paths/usernames and dev logs don't leak.
 
-## 6. Backups and snapshots are unencrypted
+## 6. Backups: encryption available; snapshots still unencrypted
 
-Every backup (and every `chat.db` snapshot) is a plain copy of the user's
-whole message history and attachments. Backups can go to external drives
-(often exFAT, with no file permissions) or to folders that sync to iCloud
-Drive.
+Backups and `chat.db` snapshots are full copies of the user's message
+history.
 
-**Done so far:** the backup step says backups aren't encrypted, and warns
-more strongly for `/Volumes/…`, iCloud Drive, and Desktop/Documents
-destinations. Snapshots live in `~/Library/Application Support/<app>/`
-(not synced). The delete panel points out leftover snapshots from earlier
-builds in `~/Documents/iMessage Backups/snapshots` (never deleted
-automatically).
+**Done:** backups can be encrypted — an AES-256 encrypted APFS sparse bundle
+created with `hdiutil` (password passed on stdin, never as an argument;
+redacted from `Debug` output), mounted only while the backup is written and
+unmounted on every exit path. Unencrypted backups say so, with a stronger
+warning for `/Volumes/…`, iCloud Drive, and Desktop/Documents destinations.
+Snapshots live in `~/Library/Application Support/<app>/` (not synced), five
+kept per kind.
 
-**Still to do:** offer encrypted backups (e.g. an encrypted APFS sparse
-bundle via `hdiutil create -encryption AES-256`, or an encrypted archive),
-and consider encrypting snapshots at rest or deleting them after a
-configurable period.
+**Still to do:** snapshots are not encrypted (they're needed for restore
+without a password prompt); consider encrypting them at rest or expiring
+them after a configurable period. Verify the real `hdiutil` flow on a Mac
+(`docs/MAC-TEST-CHECKLIST.md`, section 4) — tests use a stand-in.
 
 ## 7. Removed: unused shell plugin
 

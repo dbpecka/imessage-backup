@@ -222,9 +222,11 @@ impl Env {
                 format: format.into(),
                 destination: self.home.join("Backups").display().to_string(),
                 copy_attachments: true,
+                encrypt_password: None,
             },
             &NoopProgress,
             crate::core::space::system_available,
+            &crate::core::disk_image::FakeImageTool,
         )
         .unwrap()
     }
@@ -888,9 +890,11 @@ fn backup_and_delete_refuse_up_front_when_the_disk_is_full() {
             format: "json".into(),
             destination: env.home.join("Backups").display().to_string(),
             copy_attachments: true,
+            encrypt_password: None,
         },
         &NoopProgress,
         almost_full,
+        &crate::core::disk_image::FakeImageTool,
     )
     .unwrap_err();
     assert!(
@@ -1046,4 +1050,80 @@ fn restore_refuses_while_messages_runs_or_without_icloud_ack() {
     let err = restore(&env, &r.snapshot_path, &icloud).unwrap_err();
     assert!(matches!(err, AppError::Other(m) if m.contains("iCloud")));
     assert_eq!(env.count("SELECT COUNT(*) FROM message"), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn encrypted_backup_goes_into_an_image_that_counts_for_delete() {
+    use crate::core::disk_image::{DiskImageTool, FakeImageTool, Password};
+    let env = Env::new();
+    let b = backup_now(
+        &env.db,
+        &env.receipts,
+        RunBackupArgs {
+            filter: chat(2),
+            format: "json".into(),
+            destination: env.home.join("Backups").display().to_string(),
+            copy_attachments: true,
+            encrypt_password: Some(Password::new("correct horse battery")),
+        },
+        &NoopProgress,
+        crate::core::space::system_available,
+        &FakeImageTool,
+    )
+    .unwrap();
+    assert!(b.encrypted);
+    let image = PathBuf::from(&b.export_path);
+    assert_eq!(image.extension().unwrap(), "sparsebundle");
+    assert!(image.is_dir());
+
+    // Nothing readable outside the image, and nothing left mounted.
+    let outside: Vec<_> = fs::read_dir(env.home.join("Backups"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(outside, vec![image.file_name().unwrap().to_owned()]);
+    let leftover_mounts: Vec<_> = fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_string_lossy().contains(
+                &*image
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(' ', "_"),
+            )
+        })
+        .collect();
+    assert!(leftover_mounts.is_empty(), "{leftover_mounts:?}");
+
+    // The backup is inside, attachments included.
+    let inside = find_files(&image.join("volume"));
+    assert!(
+        inside
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("IMG_0001.HEIC")),
+        "{inside:?}"
+    );
+    assert!(inside
+        .iter()
+        .any(|p| p.extension().is_some_and(|e| e == "ndjson")));
+    assert!(
+        !b.manifest_path.starts_with('/'),
+        "manifest reported relative to the image"
+    );
+
+    // It counts for the delete step.
+    let cov = coverage_now(&env.db, &env.receipts, &chat(2)).unwrap();
+    assert!(cov.with_attachments);
+    assert_eq!(cov.export_path.as_deref(), Some(b.export_path.as_str()));
+
+    // The wrong password can't open it.
+    let mp = env.home.join("mnt");
+    fs::create_dir_all(&mp).unwrap();
+    assert!(FakeImageTool
+        .attach(&image, &mp, &Password::new("wrong password"))
+        .is_err());
 }

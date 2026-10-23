@@ -5,6 +5,7 @@ pub mod attachment_files;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod contacts;
 pub mod db_path;
+pub mod disk_image;
 pub mod filter;
 pub mod icloud;
 pub mod messages_app;

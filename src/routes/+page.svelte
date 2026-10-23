@@ -119,6 +119,20 @@
   let format = $state<ExportFormat>('json');
   let destination = $state<string>('');
   let copyAttachments = $state(true);
+  // Encrypted backups: an AES-256 disk image opened with this password.
+  let encryptBackup = $state(false);
+  let backupPassword = $state('');
+  let backupPasswordConfirm = $state('');
+  const MIN_PASSWORD_LEN = 8;
+  const passwordProblem = $derived(
+    !encryptBackup
+      ? ''
+      : backupPassword.length < MIN_PASSWORD_LEN
+        ? `Use at least ${MIN_PASSWORD_LEN} characters.`
+        : backupPassword !== backupPasswordConfirm
+          ? "The passwords don't match."
+          : ''
+  );
   let running = $state(false);
   let runError = $state<string>('');
   let runResult = $state<BackupResult | null>(null);
@@ -471,18 +485,26 @@
       runError = `Fix the date filter first: ${dateFilterError}.`;
       return;
     }
+    if (passwordProblem) {
+      runError = passwordProblem;
+      return;
+    }
     running = true;
     try {
       runResult = await api.runBackup({
         filter: buildFilter(),
         format,
         destination,
-        copyAttachments
+        copyAttachments,
+        encryptPassword: encryptBackup ? backupPassword : undefined
       });
     } catch (err) {
       runError = appErrorMessage(err);
     } finally {
       running = false;
+      // Don't keep the password around in the page longer than needed.
+      backupPassword = '';
+      backupPasswordConfirm = '';
     }
     // A new backup supersedes any earlier "delete without a backup" choice.
     if (runResult) skipBackupAcknowledged = false;
@@ -1109,19 +1131,54 @@
       Copy attachment files into the backup folder
     </label>
 
-    <p class="meta">
-      Backups aren't encrypted: anyone who can open the folder can read every message and
-      attachment in it.
-    </p>
-    {#if destinationRisk}
-      <p class="err">{destinationRisk}</p>
+    <label class="checkbox">
+      <input type="checkbox" bind:checked={encryptBackup} disabled={running} />
+      Encrypt this backup (AES-256 disk image, opened with a password)
+    </label>
+    {#if encryptBackup}
+      <div class="field">
+        <label class="grow">
+          Password
+          <input
+            type="password"
+            bind:value={backupPassword}
+            disabled={running}
+            autocomplete="new-password"
+          />
+        </label>
+        <label class="grow">
+          Confirm password
+          <input
+            type="password"
+            bind:value={backupPasswordConfirm}
+            disabled={running}
+            autocomplete="new-password"
+          />
+        </label>
+      </div>
+      {#if passwordProblem && (backupPassword || backupPasswordConfirm)}
+        <p class="meta">{passwordProblem}</p>
+      {/if}
+      <p class="meta">
+        The backup is saved as a <code>.sparsebundle</code> you open in Finder with this password.
+        <strong>If you forget the password, the backup can't be opened</strong> — keep it in your
+        password manager.
+      </p>
+    {:else}
+      <p class="meta">
+        This backup won't be encrypted: anyone who can open the folder can read every message and
+        attachment in it.
+      </p>
+      {#if destinationRisk}
+        <p class="err">{destinationRisk}</p>
+      {/if}
     {/if}
 
     <div class="actions">
       <button
         class="primary"
         onclick={runBackup}
-        disabled={running || !destination || !!dateFilterError}
+        disabled={running || !destination || !!dateFilterError || !!passwordProblem}
       >
         {running ? 'Running…' : 'Run backup'}
       </button>
@@ -1152,6 +1209,12 @@
     {#if runResult}
       <div class="summary">
         <p class="ok">Backup {runResult.attachmentCopy && runResult.attachmentCopy.failed > 0 ? 'finished with errors' : 'complete'} — {runResult.format.toUpperCase()}.</p>
+        {#if runResult.encrypted}
+          <p class="meta">
+            Saved in an encrypted disk image. Double-click it in Finder and enter your password to
+            open it.
+          </p>
+        {/if}
         {#if !runResult.countsForDelete}
           <p class="meta">
             PDF can only store basic Latin text — emoji, smart quotes and non-Latin scripts come out
@@ -1381,17 +1444,18 @@
           </label>
         {/if}
 
-        <label>
-          Type <strong>DELETE</strong> to confirm
-          <input
-            type="text"
-            bind:value={typedConfirmation}
-            disabled={deleting}
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="DELETE"
-          />
-        </label>
+        <div class="field">
+          <label>
+            <span>Type <strong>DELETE</strong> to confirm</span>
+            <input
+              type="text"
+              bind:value={typedConfirmation}
+              disabled={deleting}
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+        </div>
 
         <div class="actions">
           <button class="danger" onclick={runDelete} disabled={!deleteReady}>
@@ -1719,6 +1783,7 @@
   }
   .field input[type='search'],
   .field input[type='text'],
+  .field input[type='password'],
   .field select {
     padding: 7px 10px;
     font: inherit;

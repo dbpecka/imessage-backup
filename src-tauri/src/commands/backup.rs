@@ -23,6 +23,7 @@ use crate::core::attachment_copy::{
     annotate_json_export, copy_attachments, verify_runtime_copies, CopySummary,
 };
 use crate::core::db_path::{blocking, check_chat_db_access, default_chat_db_path, open_read};
+use crate::core::disk_image::{DiskImageTool, Hdiutil, MountedImage, Password};
 use crate::core::filter::FilterSpec;
 use crate::core::op_lock::OperationLock;
 use crate::core::progress::TauriProgress;
@@ -133,6 +134,10 @@ pub struct RunBackupArgs {
     pub destination: String,
     #[serde(default)]
     pub copy_attachments: bool,
+    /// Write the backup into a new AES-256 encrypted disk image protected
+    /// by this password, instead of a plain folder.
+    #[serde(default)]
+    pub encrypt_password: Option<Password>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +162,9 @@ pub struct BackupResult {
     /// PDF backups don't: the PDF writer can only store Latin-1 text, so
     /// emoji, smart quotes and non-Latin scripts come out as `?`.
     pub counts_for_delete: bool,
+    /// Whether the backup is inside an encrypted disk image (`export_path`
+    /// is then the `.sparsebundle`; open it in Finder with the password).
+    pub encrypted: bool,
 }
 
 /// Run a backup with the supplied filter and format into a new, timestamped
@@ -181,6 +189,7 @@ pub async fn run_backup(
             args,
             &progress,
             crate::core::space::system_available,
+            &Hdiutil,
         )
     })
     .await
@@ -194,6 +203,7 @@ pub(crate) fn backup_now(
     args: RunBackupArgs,
     progress: &dyn ProgressReporter,
     space: SpaceProbe,
+    images: &dyn DiskImageTool,
 ) -> Result<BackupResult, AppError> {
     let format = ExportType::from_cli(&args.format)
         .ok_or_else(|| AppError::Other(format!("unsupported format: {}", args.format)))?;
@@ -229,7 +239,27 @@ pub(crate) fn backup_now(
     // mistaken for this run's copies.
     std::fs::create_dir_all(&destination)?;
     let stamp = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
-    let export_path = create_unique_dir(&destination, &format!("Bubble Wrap {stamp}"))?;
+    let name = format!("Bubble Wrap {stamp}");
+
+    // Encrypted: export into a freshly created, mounted encrypted image.
+    // The guard unmounts it on every exit path, so a failed export never
+    // leaves the backup mounted and readable.
+    let mounted = match &args.encrypt_password {
+        Some(password) => Some(MountedImage::create_and_mount(
+            images,
+            &destination,
+            &name,
+            password,
+            estimate
+                .saturating_add(estimate / 2)
+                .max(1024 * 1024 * 1024),
+        )?),
+        None => None,
+    };
+    let export_root = mounted
+        .as_ref()
+        .map_or_else(|| destination.clone(), |m| m.mountpoint.clone());
+    let export_path = create_unique_dir(&export_root, &name)?;
 
     // The library's own attachment copying is collision-prone (see
     // `attachment_copy`), so JSON/PDF always run in reference mode and
@@ -245,7 +275,12 @@ pub(crate) fn backup_now(
         attachment_root: None,
         custom_owner_name: None,
     };
-    let export_label = export_path.display().to_string();
+    // What the user is told, and what the receipt checks still exists: the
+    // image itself when encrypted (the mount goes away).
+    let export_label = mounted.as_ref().map_or_else(
+        || export_path.display().to_string(),
+        |m| m.image.display().to_string(),
+    );
 
     let (message_count, attachment_count, conversation_count, manifest_path, copy_summary) =
         match format {
@@ -392,7 +427,29 @@ pub(crate) fn backup_now(
         .unwrap_or_default();
     let copied = ContentFingerprint::of(&[], &copied_ids);
 
+    // Inside an image, paths under the temporary mount mean nothing later;
+    // report the manifest relative to the image.
+    let manifest_path = match &mounted {
+        Some(m) => std::path::Path::new(&manifest_path)
+            .strip_prefix(&m.mountpoint)
+            .map(|rel| rel.display().to_string())
+            .unwrap_or(manifest_path),
+        None => manifest_path,
+    };
+    let encrypted = mounted.is_some();
+    if let Some(m) = mounted {
+        let image = m.image.clone();
+        m.detach().map_err(|e| {
+            AppError::Other(format!(
+                "The backup was written to {}, but the image couldn't be unmounted ({e:?}). \
+                 Eject it in Finder, then run the backup again so it can be used for deleting.",
+                image.display()
+            ))
+        })?;
+    }
+
     let result = BackupResult {
+        encrypted,
         message_count,
         attachment_count,
         attachment_bytes_copied: copy_summary.as_ref().map_or(0, |c| c.bytes),
