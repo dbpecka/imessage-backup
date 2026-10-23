@@ -33,6 +33,7 @@ use crate::error::AppError;
 fn write_extra_tapbacks(
     conn: &rusqlite::Connection,
     export_path: &std::path::Path,
+    file_name: &str,
     ids: &[i64],
 ) -> Result<(), AppError> {
     let mut rows = Vec::new();
@@ -60,8 +61,35 @@ fn write_extra_tapbacks(
         }
     }
     let json = serde_json::to_vec_pretty(&rows).map_err(|e| AppError::Other(e.to_string()))?;
-    std::fs::write(export_path.join("tapbacks-outside-filter.json"), json)?;
+    std::fs::write(export_path.join(file_name), json)?;
     Ok(())
+}
+
+/// Tapbacks, poll votes and poll updates matching `query` whose target
+/// message doesn't match it.
+fn children_without_target(
+    conn: &rusqlite::Connection,
+    query: &imessage_database::util::query_context::QueryContext,
+) -> Result<Vec<i64>, AppError> {
+    use imessage_database::tables::table::Table;
+    let mut guids: HashSet<String> = HashSet::new();
+    let mut children: Vec<(i64, String)> = Vec::new();
+    let mut stmt = Message::stream_rows(conn, query)?;
+    let rows = stmt.query_map([], |row| Ok(Message::from_row(row)))?;
+    for row in rows {
+        let m = Message::extract(row)?;
+        guids.insert(m.guid.clone());
+        if m.is_tapback() || m.is_poll_vote() || m.is_poll_update() {
+            if let Some(target) = &m.associated_message_guid {
+                children.push((i64::from(m.rowid), target.clone()));
+            }
+        }
+    }
+    Ok(children
+        .into_iter()
+        .filter(|(_, t)| !guids.contains(crate::commands::delete::reaction_target(t)))
+        .map(|(id, _)| id)
+        .collect())
 }
 
 fn count(r: Result<i64, imessage_database::error::table::TableError>) -> Result<u64, AppError> {
@@ -99,6 +127,10 @@ pub struct BackupResult {
     pub includes_attachments: bool,
     /// Per-attachment copy outcomes; `None` when attachments weren't copied.
     pub attachment_copy: Option<CopySummary>,
+    /// Whether this backup counts toward the delete step's backup check.
+    /// PDF backups don't: the PDF writer can only store Latin-1 text, so
+    /// emoji, smart quotes and non-Latin scripts come out as `?`.
+    pub counts_for_delete: bool,
 }
 
 /// Run a backup with the supplied filter and format into a new, timestamped
@@ -275,7 +307,28 @@ pub(crate) fn backup_now(
     // delete would remove.
     if !reaction_ids.is_empty() {
         let conn = open_read(&db_path)?;
-        write_extra_tapbacks(&conn, &export_path, &reaction_ids)?;
+        write_extra_tapbacks(
+            &conn,
+            &export_path,
+            "tapbacks-outside-filter.json",
+            &reaction_ids,
+        )?;
+    }
+    // The HTML/TXT exporters only render tapbacks and poll votes/updates
+    // under the message they belong to. When that message is outside the
+    // filter, they appear nowhere in the export, yet a delete of this
+    // filter removes them. Save those too.
+    if matches!(format, ExportType::Html | ExportType::Txt) {
+        let conn = open_read(&db_path)?;
+        let orphaned = children_without_target(&conn, &query)?;
+        if !orphaned.is_empty() {
+            write_extra_tapbacks(
+                &conn,
+                &export_path,
+                "tapbacks-without-target.json",
+                &orphaned,
+            )?;
+        }
     }
 
     // Only attachments the delete plan would touch count, so the
@@ -304,18 +357,21 @@ pub(crate) fn backup_now(
         format: format_label,
         includes_attachments: copy_summary.as_ref().is_some_and(|c| c.failed == 0),
         attachment_copy: copy_summary,
+        counts_for_delete: !matches!(format, ExportType::Pdf),
     };
 
     // Only a backup that ran to completion counts toward `run_delete`'s
     // backup gate, and it only vouches for attachments if every copy that
     // could be made was made.
-    receipts.record(
-        filter_key,
-        content,
-        copied,
-        result.includes_attachments,
-        std::path::Path::new(&result.export_path),
-    );
+    if result.counts_for_delete {
+        receipts.record(
+            filter_key,
+            content,
+            copied,
+            result.includes_attachments,
+            std::path::Path::new(&result.export_path),
+        );
+    }
 
     Ok(result)
 }

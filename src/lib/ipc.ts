@@ -116,6 +116,8 @@ export type BackupResult = {
   includesAttachments: boolean;
   /** Per-attachment copy outcomes; null when attachments weren't copied. */
   attachmentCopy: AttachmentCopySummary | null;
+  /** False for PDF: it can't store non-Latin-1 text, so it isn't a full backup. */
+  countsForDelete: boolean;
 };
 
 export type AttachmentCopySummary = {
@@ -245,6 +247,8 @@ export const api = {
     invoke<BackupCoverage>('backup_coverage', { filter }),
   scanOrphans: (includeRetained = false) =>
     invoke<OrphanScan>('scan_orphans', { includeRetained }),
-  cleanOrphans: (scanFingerprint: string, includeRetained = false) =>
-    invoke<OrphanCleanResult>('clean_orphans', { args: { scanFingerprint, includeRetained } }),
+  cleanOrphans: (scanFingerprint: string, includeRetained = false, acknowledgeIcloudSync = false) =>
+    invoke<OrphanCleanResult>('clean_orphans', {
+      args: { scanFingerprint, includeRetained, acknowledgeIcloudSync }
+    }),
 };

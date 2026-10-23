@@ -7,12 +7,13 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
+use crate::commands::delete::SafetyProbe;
 use crate::core::attachment_files::{
     attachment_roots, expand_tilde, is_within_roots, path_key, remove_attachment_file, walk_files,
     RemoveOutcome,
 };
 use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write};
-use crate::core::messages_app::is_messages_running;
+use crate::core::icloud::ICloudState;
 use crate::core::op_lock::OperationLock;
 use crate::core::retained::RetainedAttachments;
 use crate::core::snapshot::{
@@ -52,6 +53,11 @@ pub struct CleanOrphansArgs {
     /// match the `include_retained` the scan ran with.
     #[serde(default)]
     pub include_retained: bool,
+    /// Required (when records will be deleted) unless Messages in iCloud
+    /// is positively detected as disabled: chat.db's triggers queue every
+    /// deleted attachment record for iCloud deletion.
+    #[serde(default)]
+    pub acknowledge_icloud_sync: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,10 +149,66 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Resolve how chat.db spells a path into how the filesystem walk will see
+/// it, so the same file can't look unreferenced because of spelling:
+/// - rebuild from components (drops `//` and `.`),
+/// - resolve symlinks in the parent folder (e.g. an old home path left as a
+///   link after the home folder moved),
+/// - if it still isn't under an attachment root but clearly belongs to one
+///   (`…/Library/Messages/Attachments/…` under some other home), map its
+///   tail onto the current root.
+fn normalize_stored_path(path: &Path, roots: &[PathBuf]) -> PathBuf {
+    let rebuilt: PathBuf = path.components().collect();
+    let resolved = match (rebuilt.parent(), rebuilt.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| rebuilt.clone()),
+        _ => rebuilt.clone(),
+    };
+    if is_within_roots(&resolved, roots) {
+        return resolved;
+    }
+    let text = resolved.to_string_lossy();
+    let lower = text.to_lowercase();
+    for root in roots {
+        let Some(name) = root.file_name() else {
+            continue;
+        };
+        let marker = format!(
+            "/library/messages/{}/",
+            name.to_string_lossy().to_lowercase()
+        );
+        if let Some(i) = lower.rfind(&marker) {
+            let candidate = root.join(&text[i + marker.len()..]);
+            if is_within_roots(&candidate, roots) {
+                return candidate;
+            }
+        }
+    }
+    resolved
+}
+
+/// chat.db `created_date`: seconds since 2001, or nanoseconds on newer
+/// macOS. `None` when unset.
+fn created_at(apple_date: i64) -> Option<SystemTime> {
+    if apple_date <= 0 {
+        return None;
+    }
+    let secs = if apple_date > 100_000_000_000 {
+        apple_date / 1_000_000_000
+    } else {
+        apple_date
+    };
+    let unix = u64::try_from(secs).ok()? + 978_307_200;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(unix))
+}
+
 /// Find two categories of orphaned data:
 ///
 /// - **DB orphans**: rows in `attachment` with no `message_attachment_join`
-///   entry, excluding attachments the user kept via a messages-only delete.
+///   entry, excluding attachments the user kept via a messages-only delete
+///   and records created in the last [`MIN_FS_ORPHAN_AGE`] (their message
+///   may simply not have synced to this Mac yet).
 /// - **FS orphans**: files under the Messages Attachments/StickerCache
 ///   directories whose folder holds no file referenced by any `attachment`
 ///   row, and that are at least [`MIN_FS_ORPHAN_AGE`] old.
@@ -159,29 +221,51 @@ fn find_orphans(
 ) -> Result<Orphans, AppError> {
     let mut stmt = conn.prepare(
         "SELECT a.ROWID, a.filename, \
-                EXISTS (SELECT 1 FROM message_attachment_join j WHERE j.attachment_id = a.ROWID) \
+                EXISTS (SELECT 1 FROM message_attachment_join j WHERE j.attachment_id = a.ROWID), \
+                COALESCE(a.created_date, 0) \
          FROM attachment a \
          ORDER BY a.ROWID",
     )?;
-    let rows: Vec<(i64, Option<String>, bool)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    let rows: Vec<(i64, Option<String>, bool, i64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .collect::<Result<_, _>>()?;
 
     let mut referenced_dirs: HashSet<String> = HashSet::new();
+    // Every file any record points at. Never a filesystem orphan, even when
+    // it sits directly in a root folder (where folder matching stops).
+    let mut referenced_files: HashSet<String> = HashSet::new();
     let mut kept_files: HashSet<String> = HashSet::new();
     let mut candidates: Vec<(i64, Option<PathBuf>)> = Vec::new();
     let mut existing: HashSet<i64> = HashSet::new();
     let mut out = Orphans::default();
 
-    for (rowid, filename, linked) in rows {
-        let path = filename.as_deref().map(expand_tilde);
+    for (rowid, filename, linked, created) in rows {
+        let path = filename
+            .as_deref()
+            .map(|f| normalize_stored_path(&expand_tilde(f), roots));
         if let Some(p) = &path {
+            referenced_files.insert(path_key(p));
             if let Some(parent) = p.parent() {
                 referenced_dirs.insert(path_key(parent));
             }
         }
         existing.insert(rowid);
         let is_retained = !linked && retained.contains(&rowid);
+        // Unset dates count as old; a date in the future (clock skew)
+        // counts as new.
+        let too_new = created_at(created).is_some_and(|t| {
+            now.duration_since(t)
+                .map_or(true, |age| age < MIN_FS_ORPHAN_AGE)
+        });
+        if too_new && !linked {
+            // Treat like a linked record: keep it and its file.
+            if let Some(p) = &path {
+                kept_files.insert(path_key(p));
+            }
+            continue;
+        }
         if linked || (is_retained && !include_retained) {
             if let Some(p) = &path {
                 kept_files.insert(path_key(p));
@@ -220,7 +304,10 @@ fn find_orphans(
         let mut files = Vec::new();
         walk_files(root, &mut files);
         for path in files {
-            if in_referenced_dir(&path, root, &referenced_dirs) || is_recent(&path, now) {
+            if referenced_files.contains(&path_key(&path))
+                || in_referenced_dir(&path, root, &referenced_dirs)
+                || is_recent(&path, now)
+            {
                 continue;
             }
             out.fs_bytes = out.fs_bytes.saturating_add(file_len(&path));
@@ -327,21 +414,17 @@ pub async fn clean_orphans(
     let _guard = lock.try_acquire("a cleanup")?;
     let store = RetainedAttachments::for_app(&app)?;
     let snapshot_root = default_snapshot_root(&app, SnapshotKind::OrphanClean)?;
-    blocking(move || {
-        clean_orphans_blocking(&store, &snapshot_root, &args, || {
-            is_messages_running().unwrap_or(true)
-        })
-    })
-    .await
+    blocking(move || clean_orphans_blocking(&store, &snapshot_root, &args, &SafetyProbe::system()))
+        .await
 }
 
 pub(crate) fn clean_orphans_blocking(
     store: &RetainedAttachments,
     snapshot_root: &Path,
     args: &CleanOrphansArgs,
-    messages_running: fn() -> bool,
+    probe: &SafetyProbe,
 ) -> Result<OrphanCleanResult, AppError> {
-    ensure_messages_not_running(messages_running)?;
+    ensure_messages_not_running(probe.messages_running)?;
 
     let db_path = default_chat_db_path()?;
     let roots = attachment_roots();
@@ -365,6 +448,17 @@ pub(crate) fn clean_orphans_blocking(
                 .into(),
         ));
     }
+    if !orphans.db.is_empty()
+        && (probe.icloud)() != ICloudState::Disabled
+        && !args.acknowledge_icloud_sync
+    {
+        return Err(AppError::Other(
+            "Removing attachment records queues them for deletion in Messages in iCloud, which \
+             can remove them from your other devices too. Acknowledge the iCloud warning in the \
+             cleanup dialog (or pass acknowledgeIcloudSync=true) before retrying."
+                .into(),
+        ));
+    }
 
     let mut db_rows_deleted = 0u64;
     let mut snapshot_path = None;
@@ -375,12 +469,26 @@ pub(crate) fn clean_orphans_blocking(
     if !orphans.db.is_empty() {
         checkpoint_wal(&db_path)?;
         let snapshot = snapshot_chat_db(&db_path, snapshot_root)?;
+
+        // If anything fails before the rows are deleted, nothing changed:
+        // drop the redundant snapshot instead of letting it push an older
+        // one out, and only prune after a successful clean.
+        let result = (|| {
+            ensure_messages_not_running(probe.messages_running)?;
+            let mut conn = open_write(&db_path)?;
+            delete_orphan_rows(&mut conn, &orphans.db)
+        })();
+        deleted = match result {
+            Ok(d) => d,
+            Err(e) => {
+                if let Err(re) = std::fs::remove_dir_all(&snapshot.dir) {
+                    eprintln!("orphan-clean: couldn't remove unused snapshot: {re}");
+                }
+                return Err(e);
+            }
+        };
         prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
         snapshot_path = Some(snapshot.dir.display().to_string());
-
-        ensure_messages_not_running(messages_running)?;
-        let mut conn = open_write(&db_path)?;
-        deleted = delete_orphan_rows(&mut conn, &orphans.db)?;
         db_rows_deleted = deleted.len() as u64;
         // The included kept attachments that are gone now; stop tracking
         // them.
@@ -443,7 +551,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let conn = Connection::open(tmp.path().join("chat.db")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT);
+            "CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT, created_date INTEGER DEFAULT 0);
              CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);",
         )
         .unwrap();

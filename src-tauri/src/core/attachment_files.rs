@@ -19,8 +19,16 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The attachment folders, with symlinks resolved when they exist, so
+/// walked paths and normalised chat.db paths compare like for like.
 pub fn attachment_roots() -> Vec<PathBuf> {
-    ATTACHMENT_DIRS.iter().map(|d| expand_tilde(d)).collect()
+    ATTACHMENT_DIRS
+        .iter()
+        .map(|d| {
+            let p = expand_tilde(d);
+            fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect()
 }
 
 /// Case-insensitive comparison key for a path. APFS is case-insensitive by
@@ -85,16 +93,25 @@ pub fn remove_attachment_file(path: &Path, roots: &[PathBuf], context: &str) -> 
             return RemoveOutcome::Failed;
         }
     };
-    if !meta.file_type().is_file() || !is_within_roots(path, roots) {
+    // Check containment on the real location: resolve symlinks in the
+    // parent folders (the file itself must not be a link — checked above via
+    // `symlink_metadata`), so a link anywhere up the path can't point the
+    // removal outside the Messages folders, and a symlinked home still
+    // matches the canonical roots.
+    let real = match (path.parent().map(fs::canonicalize), path.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    };
+    if !meta.file_type().is_file() || !is_within_roots(&real, roots) {
         eprintln!(
             "{context}: refusing to remove {} (not a regular file inside the Messages attachment folders)",
             path.display()
         );
         return RemoveOutcome::Refused;
     }
-    match fs::remove_file(path) {
+    match fs::remove_file(&real) {
         Ok(()) => {
-            remove_empty_parents(path, roots);
+            remove_empty_parents(&real, roots);
             RemoveOutcome::Removed
         }
         Err(e) => {
@@ -183,6 +200,35 @@ mod tests {
         assert_eq!(
             remove_attachment_file(&inside, &roots, "test"),
             RemoveOutcome::Missing
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_follows_the_real_location_of_parent_folders() {
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("Attachments");
+        fs::create_dir_all(real_root.join("ab")).unwrap();
+        let roots = vec![fs::canonicalize(&real_root).unwrap()];
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.jpg"), b"x").unwrap();
+
+        // A folder link inside the root that points outside it.
+        std::os::unix::fs::symlink(&outside, real_root.join("ab/escape")).unwrap();
+        assert_eq!(
+            remove_attachment_file(&real_root.join("ab/escape/keep.jpg"), &roots, "test"),
+            RemoveOutcome::Refused
+        );
+        assert!(outside.join("keep.jpg").exists());
+
+        // The root reached through a linked alias still works.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+        fs::write(real_root.join("ab/a.jpg"), b"x").unwrap();
+        assert_eq!(
+            remove_attachment_file(&alias.join("ab/a.jpg"), &roots, "test"),
+            RemoveOutcome::Removed
         );
     }
 
