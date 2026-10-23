@@ -243,7 +243,7 @@ pub async fn scan_orphans(
     blocking(move || scan_orphans_blocking(&store, include_retained)).await
 }
 
-fn scan_orphans_blocking(
+pub(crate) fn scan_orphans_blocking(
     store: &RetainedAttachments,
     include_retained: bool,
 ) -> Result<OrphanScan, AppError> {
@@ -299,8 +299,8 @@ fn delete_orphan_rows(conn: &mut Connection, rows: &[DbOrphan]) -> Result<HashSe
     Ok(deleted)
 }
 
-fn ensure_messages_not_running() -> Result<(), AppError> {
-    if is_messages_running().unwrap_or(true) {
+fn ensure_messages_not_running(messages_running: fn() -> bool) -> Result<(), AppError> {
+    if messages_running() {
         return Err(AppError::Other(
             "Quit Messages.app before cleaning orphaned data — it may be writing new \
              attachments."
@@ -327,15 +327,21 @@ pub async fn clean_orphans(
     let _guard = lock.try_acquire("a cleanup")?;
     let store = RetainedAttachments::for_app(&app)?;
     let snapshot_root = default_snapshot_root(&app, SnapshotKind::OrphanClean)?;
-    blocking(move || clean_orphans_blocking(&store, &snapshot_root, &args)).await
+    blocking(move || {
+        clean_orphans_blocking(&store, &snapshot_root, &args, || {
+            is_messages_running().unwrap_or(true)
+        })
+    })
+    .await
 }
 
-fn clean_orphans_blocking(
+pub(crate) fn clean_orphans_blocking(
     store: &RetainedAttachments,
     snapshot_root: &Path,
     args: &CleanOrphansArgs,
+    messages_running: fn() -> bool,
 ) -> Result<OrphanCleanResult, AppError> {
-    ensure_messages_not_running()?;
+    ensure_messages_not_running(messages_running)?;
 
     let db_path = default_chat_db_path()?;
     let roots = attachment_roots();
@@ -372,7 +378,7 @@ fn clean_orphans_blocking(
         prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
         snapshot_path = Some(snapshot.dir.display().to_string());
 
-        ensure_messages_not_running()?;
+        ensure_messages_not_running(messages_running)?;
         let mut conn = open_write(&db_path)?;
         deleted = delete_orphan_rows(&mut conn, &orphans.db)?;
         db_rows_deleted = deleted.len() as u64;

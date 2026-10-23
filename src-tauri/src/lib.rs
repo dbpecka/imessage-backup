@@ -2,6 +2,9 @@ mod commands;
 mod core;
 mod error;
 
+#[cfg(test)]
+mod e2e_tests;
+
 pub use error::AppError;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -20,7 +23,7 @@ pub fn run() {
                 }
                 Err(_) => core::receipts::BackupReceipts::default(),
             };
-            app.manage(receipts);
+            app.manage(std::sync::Arc::new(receipts));
 
             let clean_item =
                 MenuItemBuilder::with_id("clean-orphans", "Clean Orphaned Data…").build(app)?;

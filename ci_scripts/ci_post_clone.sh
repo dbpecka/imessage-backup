@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xcode Cloud post-clone hook — installs toolchain, fetches sibling dep, builds Tauri.
+# Xcode Cloud post-clone hook — installs toolchain, builds Tauri.
 set -euo pipefail
 
 REPO_DIR="/Volumes/workspace/repository"
@@ -21,18 +21,9 @@ if ! command -v node &>/dev/null; then
     brew install node
 fi
 
-# --- Sibling repo: imessage-exporter fork ---
-# Cargo.toml has a path dep: path = "../../imessage-exporter/imessage-database"
-# Relative to src-tauri/ that resolves to /Volumes/workspace/imessage-exporter/.
-EXPORTER_DIR="$WORKSPACE_DIR/imessage-exporter"
-if [ ! -d "$EXPORTER_DIR" ]; then
-    # Derive the GitHub user from this repo's origin URL (works for both HTTPS and SSH remotes).
-    ORIGIN=$(git -C "$REPO_DIR" remote get-url origin)
-    GITHUB_USER=$(echo "$ORIGIN" | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|')
-    git clone --depth 1 --branch develop \
-        "https://github.com/$GITHUB_USER/imessage-exporter.git" \
-        "$EXPORTER_DIR"
-fi
+# --- imessage-exporter fork ---
+# A git dependency pinned to an exact commit in src-tauri/Cargo.toml; cargo
+# fetches it from GitHub during the build, so no separate clone is needed.
 
 # --- Build ---
 cd "$REPO_DIR"

@@ -1731,6 +1731,7 @@ dependencies = [
 [[package]]
 name = "imessage-database"
 version = "0.0.0"
+source = "git+https://github.com/dbpecka/imessage-exporter?rev=cffac6a59099f8c1398c4089bd20fe222d983fa0#cffac6a59099f8c1398c4089bd20fe222d983fa0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

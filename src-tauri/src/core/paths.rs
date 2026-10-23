@@ -28,9 +28,7 @@ pub fn validate_user_path(raw: &str, purpose: &str) -> Result<PathBuf, AppError>
         )));
     }
 
-    let home = std::env::var("HOME")
-        .map_err(|_| AppError::Other("HOME environment variable is not set".into()))?;
-    let home = canonical_or_self(Path::new(&home));
+    let home = canonical_or_self(&crate::core::db_path::home_dir()?);
     let canonical = canonical_prefix(&p);
 
     let messages_dir = home.join("Library/Messages");

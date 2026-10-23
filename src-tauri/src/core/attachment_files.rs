@@ -12,8 +12,8 @@ const ATTACHMENT_DIRS: &[&str] = &[
 /// own `gen_macos_attachment` behaviour.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with('~') {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(path.replacen('~', &home, 1));
+        if let Ok(home) = crate::core::db_path::home_dir() {
+            return PathBuf::from(path.replacen('~', &home.to_string_lossy(), 1));
         }
     }
     PathBuf::from(path)
