@@ -9,8 +9,8 @@ use tauri::{AppHandle, State};
 
 use crate::commands::delete::SafetyProbe;
 use crate::core::attachment_files::{
-    attachment_roots, expand_tilde, is_within_roots, path_key, remove_attachment_file, walk_files,
-    RemoveOutcome,
+    attachment_roots, canonical_roots, expand_tilde, is_within_roots, path_key,
+    remove_attachment_file, walk_files, RemoveOutcome,
 };
 use crate::core::db_path::{blocking, default_chat_db_path, open_read, open_write};
 use crate::core::icloud::ICloudState;
@@ -159,10 +159,12 @@ fn file_len(path: &Path) -> u64 {
 ///   tail onto the current root.
 fn normalize_stored_path(path: &Path, roots: &[PathBuf]) -> PathBuf {
     let rebuilt: PathBuf = path.components().collect();
+    // Resolve the longest part of the parent folder that exists, so a
+    // symlinked prefix is resolved even if the last folders don't exist
+    // exactly as spelled (e.g. a case difference on a case-sensitive
+    // volume).
     let resolved = match (rebuilt.parent(), rebuilt.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .map(|p| p.join(name))
-            .unwrap_or_else(|_| rebuilt.clone()),
+        (Some(parent), Some(name)) => crate::core::paths::canonical_prefix(parent).join(name),
         _ => rebuilt.clone(),
     };
     if is_within_roots(&resolved, roots) {
@@ -219,6 +221,8 @@ fn find_orphans(
     roots: &[PathBuf],
     now: SystemTime,
 ) -> Result<Orphans, AppError> {
+    // Stored paths are resolved below; compare (and walk) resolved roots.
+    let roots = &canonical_roots(roots);
     let mut stmt = conn.prepare(
         "SELECT a.ROWID, a.filename, \
                 EXISTS (SELECT 1 FROM message_attachment_join j WHERE j.attachment_id = a.ROWID), \
@@ -553,7 +557,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn fixture(tmp: &TempDir) -> (Connection, PathBuf) {
-        let root = tmp.path().join("Attachments");
+        // Resolved, like the app's real roots (macOS's temp folder is under
+        // the `/var` → `/private/var` symlink).
+        let root = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("Attachments");
         fs::create_dir_all(&root).unwrap();
         let conn = Connection::open(tmp.path().join("chat.db")).unwrap();
         conn.execute_batch(

@@ -62,7 +62,7 @@ fn is_on_mounted_volume(canonical: &Path) -> bool {
 /// Canonicalise as much of `path` as already exists; preserve the rest.
 /// Needed because `fs::canonicalize` errors when the target doesn't yet
 /// exist (typical for new backup destinations).
-fn canonical_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonical_prefix(path: &Path) -> PathBuf {
     let mut existing = path.to_path_buf();
     let mut trailing: Vec<std::ffi::OsString> = Vec::new();
     while !existing.exists() {
