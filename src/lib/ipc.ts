@@ -102,6 +102,8 @@ export type RunBackupArgs = {
   format: ExportFormat;
   destination: string;
   copyAttachments?: boolean;
+  /** Write into a new AES-256 encrypted disk image protected by this password. */
+  encryptPassword?: string;
 };
 
 export type BackupResult = {
@@ -118,6 +120,8 @@ export type BackupResult = {
   attachmentCopy: AttachmentCopySummary | null;
   /** False for PDF: it can't store non-Latin-1 text, so it isn't a full backup. */
   countsForDelete: boolean;
+  /** True when exportPath is an encrypted .sparsebundle. */
+  encrypted: boolean;
 };
 
 export type AttachmentCopySummary = {
