@@ -124,7 +124,7 @@ const ICLOUD_RISK: &str = "Deleting here records each deletion for Messages in i
 
 /// Extract the target message guid from an `associated_message_guid`
 /// (`p:0/<guid>`, `bp:<guid>`, or a bare guid).
-fn reaction_target(associated: &str) -> &str {
+pub(crate) fn reaction_target(associated: &str) -> &str {
     if let Some(rest) = associated.strip_prefix("bp:") {
         rest
     } else if let Some(rest) = associated.strip_prefix("p:") {
@@ -301,6 +301,34 @@ pub(crate) fn present_attachments(conn: &Connection, ids: &[i64]) -> Result<Vec<
     Ok(out)
 }
 
+/// The library collects attachments per chunk of 800 messages with a
+/// per-chunk `DISTINCT`, so an attachment linked from messages in two
+/// chunks is listed (and its size counted) twice. De-duplicate the ids and
+/// files and recompute the total from the database.
+fn dedup_attachments(conn: &Connection, plan: &mut DeletePlan) -> Result<(), AppError> {
+    let before = plan.attachment_rowids.len();
+    plan.attachment_rowids.sort_unstable();
+    plan.attachment_rowids.dedup();
+    let mut seen: HashSet<String> = HashSet::new();
+    plan.attachment_files_on_disk
+        .retain(|p| seen.insert(path_key(p)));
+    if plan.attachment_rowids.len() == before {
+        return Ok(());
+    }
+    let mut total: u64 = 0;
+    for chunk in plan.attachment_rowids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(total_bytes, 0) FROM attachment WHERE ROWID IN ({placeholders})"
+        ))?;
+        for b in stmt.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))? {
+            total = total.saturating_add(b?.max(0) as u64);
+        }
+    }
+    plan.attachment_bytes = total;
+    Ok(())
+}
+
 pub(crate) fn filter_content(
     conn: &Connection,
     ctx: &QueryContext,
@@ -308,6 +336,7 @@ pub(crate) fn filter_content(
 ) -> Result<FilterContent, AppError> {
     let mut plan = lib_preview_delete(conn, ctx, &AttachmentFilter::any(), db_path)
         .map_err(|e| AppError::Database(format!("failed to compute delete plan: {e}")))?;
+    dedup_attachments(conn, &mut plan)?;
     let reaction_ids = add_orphaned_reactions(conn, &mut plan)?;
     let content = ContentFingerprint::of(&plan.message_rowids, &plan.attachment_rowids);
     let present = ContentFingerprint::of(&[], &present_attachments(conn, &plan.attachment_rowids)?);
@@ -718,26 +747,36 @@ pub(crate) fn delete_now(
     // Gate 4: mandatory WAL checkpoint + snapshot.
     checkpoint_wal(db_path)?;
     let snapshot = snapshot_chat_db(db_path, snapshot_root)?;
-    if managed_root {
-        // Only ever prune the folder we own; a caller-chosen root is
-        // theirs.
-        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
-    }
 
-    // Re-check right before writing: the snapshot of a large chat.db
-    // can take long enough for the user to reopen Messages.
-    ensure_messages_not_running(probe)?;
-
-    // Now execute against a writable connection.
-    let mut write_conn = open_write(db_path)?;
-    let report = match execute_delete(&mut write_conn, &plan) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(AppError::Database(format!(
+    // Everything that can still fail before the delete commits. If any of
+    // it does, nothing changed, so the snapshot just taken is redundant:
+    // remove it rather than let it push an older (real) rollback out.
+    let committed = (|| {
+        // Re-check right before writing: the snapshot of a large chat.db
+        // can take long enough for the user to reopen Messages.
+        ensure_messages_not_running(probe)?;
+        let mut write_conn = open_write(db_path)?;
+        let report = execute_delete(&mut write_conn, &plan).map_err(|e| {
+            AppError::Database(format!(
                 "delete transaction failed (rolled back; no changes made): {e}"
-            )));
+            ))
+        })?;
+        Ok::<_, AppError>((write_conn, report))
+    })();
+    let (mut write_conn, report) = match committed {
+        Ok(c) => c,
+        Err(e) => {
+            if let Err(re) = std::fs::remove_dir_all(&snapshot.dir) {
+                eprintln!("delete: couldn't remove unused snapshot: {re}");
+            }
+            return Err(e);
         }
     };
+    if managed_root {
+        // Only after a successful delete, and only in the folder we own; a
+        // caller-chosen root is theirs.
+        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
+    }
     if let Err(e) = clear_stale_attachment_flags(&mut write_conn, &flag_candidates) {
         eprintln!("delete: couldn't clear attachment flags on kept messages: {e:?}");
     }

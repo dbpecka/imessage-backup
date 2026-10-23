@@ -707,7 +707,7 @@
     "featureList": [
       "Export iMessages to HTML, PDF, plain text, or JSON",
       "Back up photos and attachments",
-      "Filter by date range or contact",
+      "Filter by date range or conversation",
       "Preview before deleting",
       "Automatic database snapshot before deletion",
       "Reclaim gigabytes of disk space"
@@ -749,7 +749,7 @@
         "name": "Is it safe to delete messages with Bubble Wrap?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes. Bubble Wrap uses a multi-step safety process: first you preview exactly what will be affected, then the app automatically saves a complete snapshot of your Messages database to your Documents folder, and finally you must type a confirmation word before any deletion runs."
+          "text": "Bubble Wrap uses a multi-step safety process: you preview exactly what will be affected, the app checks that a backup covers exactly those messages and attachments, it saves a snapshot of your Messages database, and you must type DELETE before anything is removed. The snapshot only covers the database, so deleted attachment files can only be restored from your backup. If Messages in iCloud is on, deletions are expected to sync to your other devices."
         }
       },
       {
@@ -858,7 +858,7 @@
         </div>
         <div class="feat-card reveal">
           <div class="feat-icon ic-violet">🔎</div>
-          <div class="feat-title">Filter by date or contact</div>
+          <div class="feat-title">Filter by date or conversation</div>
           <p class="feat-desc">Choose any date range and pick specific conversations — archive just the messages that matter to you.</p>
         </div>
         <div class="feat-card reveal">
@@ -906,7 +906,7 @@
       <p class="eyebrow">Built for peace of mind</p>
       <h2 class="heading reveal" style="text-align:center">We take "safely" seriously.</h2>
       <p class="reveal" style="font-size:1.05rem;color:var(--text-mid);line-height:1.65;max-width:52ch;margin:0 auto;text-align:center">
-        Deleting messages can feel scary. That's why Bubble Wrap uses a multi-step safety process — nothing is removed until every check passes, and you can always roll back.
+        Deleting messages can feel scary. That's why Bubble Wrap uses a multi-step safety process — nothing is removed until every check passes. Deleting is permanent for attachment files, so keep your backup.
       </p>
 
       <div class="safety-cards">
@@ -917,13 +917,13 @@
         </div>
         <div class="safety-card reveal">
           <div class="safety-step-n">Step 2</div>
-          <div class="safety-step-t">Automatic snapshot</div>
-          <p class="safety-step-d">A complete copy of your Messages database is saved to your Documents folder before any deletion runs.</p>
+          <div class="safety-step-t">Backup check &amp; snapshot</div>
+          <p class="safety-step-d">Bubble Wrap checks that a backup holds exactly what you're about to delete, then saves a copy of your Messages database so the deletion can be undone. Attachment files are restored from your backup.</p>
         </div>
         <div class="safety-card reveal">
           <div class="safety-step-n">Step 3</div>
           <div class="safety-step-t">Typed confirmation</div>
-          <p class="safety-step-d">You must type a confirmation word before the deletion runs — no accidental taps or clicks.</p>
+          <p class="safety-step-d">You must type DELETE before the deletion runs — no accidental taps or clicks.</p>
         </div>
       </div>
     </div>

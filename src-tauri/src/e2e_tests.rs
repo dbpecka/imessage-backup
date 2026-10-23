@@ -524,8 +524,9 @@ fn orphan_cleanup_removes_only_true_orphans() {
         &CleanOrphansArgs {
             scan_fingerprint: scan.fingerprint,
             include_retained: false,
+            acknowledge_icloud_sync: false,
         },
-        || false,
+        &quiet_mac(),
     )
     .unwrap();
     assert_eq!(r.db_rows_deleted, 1);
@@ -560,8 +561,9 @@ fn orphan_clean_refuses_if_anything_changed_since_the_scan() {
         &CleanOrphansArgs {
             scan_fingerprint: scan.fingerprint,
             include_retained: false,
+            acknowledge_icloud_sync: false,
         },
-        || false,
+        &quiet_mac(),
     )
     .unwrap_err();
     assert!(matches!(err, AppError::Other(m) if m.contains("changed since the scan")));
@@ -584,4 +586,252 @@ fn html_backup_keeps_original_attachment_bytes() {
     assert_eq!(heic.len(), 1, "{heic:?}");
     assert_eq!(fs::read(&heic[0]).unwrap(), b"recent heic bytes");
     assert!(b.includes_attachments);
+}
+
+// ---- Regression tests from the final review ----
+
+/// Age a file so the 24-hour guard doesn't protect it.
+fn make_old(p: &Path) {
+    fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+        .unwrap();
+}
+
+fn scan_and_clean(
+    env: &Env,
+    icloud_ack: bool,
+    probe: &SafetyProbe,
+) -> Result<crate::commands::orphans::OrphanCleanResult, AppError> {
+    let scan = scan_orphans_blocking(&env.retained, false).unwrap();
+    clean_orphans_blocking(
+        &env.retained,
+        &env.home.join("orphan-snapshots"),
+        &CleanOrphansArgs {
+            scan_fingerprint: scan.fingerprint,
+            include_retained: false,
+            acknowledge_icloud_sync: icloud_ack,
+        },
+        probe,
+    )
+}
+
+#[test]
+fn pdf_backup_does_not_count_for_delete() {
+    let env = Env::new();
+    // The PDF writer can only store Latin-1: this would come out as `?`.
+    env.add_message(6, 2, 2, apple_date(2020, 7, 1), "Привет 😀 it’s");
+    let b = env.backup(chat(2), "pdf");
+    assert!(!b.counts_for_delete);
+    assert!(
+        !coverage_now(&env.db, &env.receipts, &chat(2))
+            .unwrap()
+            .covered
+    );
+    let err = env.delete(chat(2), DeleteScope::Both, false).unwrap_err();
+    assert!(matches!(err, AppError::Other(m) if m.contains("No backup covers")));
+
+    // A JSON backup of the same thing does count.
+    let b = env.backup(chat(2), "json");
+    assert!(b.counts_for_delete);
+    assert!(
+        env.delete(chat(2), DeleteScope::Both, false)
+            .unwrap()
+            .backup_verified
+    );
+}
+
+#[test]
+fn html_backup_saves_tapbacks_whose_target_is_outside_the_filter() {
+    let env = Env::new();
+    // m5 (chat 2) is a tapback on m1 (chat 1): the HTML exporter only
+    // renders it under m1, which isn't in a chat-2 export.
+    let b = env.backup(chat(2), "html");
+    let saved =
+        fs::read_to_string(Path::new(&b.export_path).join("tapbacks-without-target.json")).unwrap();
+    assert!(saved.contains("\"guid\": \"g5\""), "{saved}");
+}
+
+#[test]
+fn failed_delete_attempts_keep_the_earlier_rollback_snapshot() {
+    let env = Env::new();
+    let snaps = env.home.join("snapshots");
+    let first = env.delete(chat(2), DeleteScope::Both, true).unwrap();
+    let rollback = PathBuf::from(&first.snapshot_path);
+
+    // Messages reopens during every later attempt, after the snapshot.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn reopens() -> bool {
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 2 == 1
+    }
+    for _ in 0..(crate::core::snapshot::SNAPSHOTS_TO_KEEP + 2) {
+        std::thread::sleep(Duration::from_millis(1100));
+        let p = env.preview(&chat(1));
+        let r = delete_now(
+            &env.db,
+            &env.receipts,
+            RunDeleteArgs {
+                filter: chat(1),
+                confirmation_phrase: DELETE_CONFIRMATION_PHRASE.into(),
+                acknowledge_skip_backup: true,
+                snapshot_root: None,
+                delete_scope: DeleteScope::Both,
+                acknowledge_icloud_sync: false,
+                acknowledge_not_on_mac: false,
+                expected_message_count: Some(p.message_count),
+                expected_attachment_count: Some(p.attachment_count),
+            },
+            &snaps,
+            true,
+            &SafetyProbe {
+                messages_running: reopens,
+                icloud: || ICloudState::Disabled,
+            },
+        );
+        assert!(r.is_err());
+    }
+    assert!(
+        rollback.exists(),
+        "failed attempts pruned the real rollback"
+    );
+    // …and they left no snapshots of their own behind.
+    assert_eq!(fs::read_dir(&snaps).unwrap().count(), 1);
+}
+
+#[test]
+fn attachments_shared_across_chunks_are_counted_once() {
+    let env = Env::new();
+    // 900 messages, so the library splits them into two chunks of ≤800;
+    // attachment 9 is linked from one message in each.
+    {
+        let c = env.conn();
+        for i in 0..900i64 {
+            let id = 100 + i;
+            c.execute(
+                "INSERT INTO message (ROWID, guid, text, handle_id, date, service) \
+                 VALUES (?1, ?2, '\u{FFFC}', 2, ?3, 'iMessage')",
+                params![id, format!("bulk{id}"), apple_date(2021, 1, 1) + i],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (2, ?1, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+    }
+    let f = env.file("b9/09/G/x.jpg", b"jpeg");
+    env.add_attachment(9, &f, "image/jpeg", Some(100));
+    env.conn()
+        .execute(
+            "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (999, 9)",
+            [],
+        )
+        .unwrap();
+    let p = env.preview(&chat(2));
+    // Attachment 4 (m4) and attachment 9, each once.
+    assert_eq!(p.attachment_count, 2);
+    assert_eq!(p.attachment_bytes, 15 + 4);
+}
+
+#[test]
+fn orphan_clean_requires_icloud_acknowledgement() {
+    let env = Env::new();
+    let f = env.file("a7/07/GUID-7/unlinked.jpg", b"unlinked");
+    env.add_attachment(7, &f, "image/jpeg", None);
+    let icloud_on = SafetyProbe {
+        messages_running: || false,
+        icloud: || ICloudState::Enabled,
+    };
+    let err = scan_and_clean(&env, false, &icloud_on).unwrap_err();
+    assert!(matches!(err, AppError::Other(m) if m.contains("iCloud")));
+    assert!(f.exists());
+
+    let r = scan_and_clean(&env, true, &icloud_on).unwrap();
+    assert_eq!(r.db_rows_deleted, 1);
+}
+
+#[test]
+fn recently_created_unlinked_record_is_not_an_orphan() {
+    let env = Env::new();
+    let f = env.file("a7/07/GUID-7/just-arrived.jpg", b"new");
+    env.add_attachment(7, &f, "image/jpeg", None);
+    // Created a minute ago — its message may not have synced yet.
+    let now_apple = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - APPLE_EPOCH_OFFSET
+        - 60;
+    env.conn()
+        .execute(
+            "UPDATE attachment SET created_date = ?1 WHERE ROWID = 7",
+            params![now_apple],
+        )
+        .unwrap();
+    let scan = scan_orphans_blocking(&env.retained, false).unwrap();
+    assert_eq!(scan.db_orphan_count, 0);
+    assert!(f.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_file_stored_via_symlinked_home_is_kept() {
+    let env = Env::new();
+    let alias = env.home.parent().unwrap().join("old-home-name");
+    std::os::unix::fs::symlink(&env.home, &alias).unwrap();
+    let real = env
+        .home
+        .join("Library/Messages/StickerCache/8e-GUID/GUID.heic");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    fs::write(&real, b"sticker").unwrap();
+    make_old(&real);
+    let stored = alias.join("Library/Messages/StickerCache/8e-GUID/GUID.heic");
+    env.add_attachment(20, &stored, "image/heic", Some(3));
+
+    let r = scan_and_clean(&env, false, &quiet_mac()).unwrap();
+    assert_eq!(r.fs_files_removed, 0);
+    assert!(real.exists());
+}
+
+#[test]
+fn linked_file_stored_under_a_renamed_home_is_kept() {
+    let env = Env::new();
+    // chat.db still says /Users/<old name>/…, which no longer exists.
+    let real = env.file("c1/01/GUID-C/photo.jpg", b"photo");
+    make_old(&real);
+    let stored = PathBuf::from(
+        "/Users/old-name-that-does-not-exist/Library/Messages/Attachments/c1/01/GUID-C/photo.jpg",
+    );
+    env.add_attachment(23, &stored, "image/jpeg", Some(3));
+    let r = scan_and_clean(&env, false, &quiet_mac()).unwrap();
+    assert_eq!(r.fs_files_removed, 0);
+    assert!(real.exists());
+}
+
+#[test]
+fn linked_file_with_double_slash_path_is_kept() {
+    let env = Env::new();
+    let f = env.file("b1/01/GUID-B/pic.jpg", b"pic");
+    make_old(&f);
+    let stored = f.to_str().unwrap().replace("/b1/01/", "/b1//01/");
+    env.add_attachment(22, Path::new(&stored), "image/jpeg", Some(3));
+    let r = scan_and_clean(&env, false, &quiet_mac()).unwrap();
+    assert_eq!(r.fs_files_removed, 0);
+    assert!(f.exists());
+}
+
+#[test]
+fn linked_file_directly_in_a_root_folder_is_kept() {
+    let env = Env::new();
+    let f = env.home.join("Library/Messages/StickerCache/sticker.heic");
+    fs::create_dir_all(f.parent().unwrap()).unwrap();
+    fs::write(&f, b"sticker").unwrap();
+    make_old(&f);
+    env.add_attachment(21, &f, "image/heic", Some(3));
+    let r = scan_and_clean(&env, false, &quiet_mac()).unwrap();
+    assert_eq!(r.fs_files_removed, 0);
+    assert!(f.exists());
 }
