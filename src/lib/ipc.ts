@@ -208,6 +208,22 @@ export type BackupCoverage = {
   exportPath: string | null;
 };
 
+export type SnapshotKind = 'delete' | 'orphanClean' | 'preRestore';
+
+export type SnapshotInfo = {
+  path: string;
+  kind: SnapshotKind;
+  /** When its chat.db was written, Unix seconds. */
+  takenAtUnix: number;
+  bytes: number;
+};
+
+export type RestoreResult = {
+  restoredFrom: string;
+  /** The database just before the restore, so the restore can be undone. */
+  preRestoreSnapshot: string;
+};
+
 export type OrphanScan = {
   dbOrphanCount: number;
   dbOrphanBytes: number;
@@ -245,6 +261,9 @@ export const api = {
   runDelete: (args: RunDeleteArgs) => invoke<DeleteResult>('run_delete', { args }),
   backupCoverage: (filter: FilterSpec) =>
     invoke<BackupCoverage>('backup_coverage', { filter }),
+  listSnapshots: () => invoke<SnapshotInfo[]>('list_snapshots'),
+  restoreSnapshot: (snapshotPath: string, acknowledgeIcloudSync: boolean) =>
+    invoke<RestoreResult>('restore_snapshot', { args: { snapshotPath, acknowledgeIcloudSync } }),
   scanOrphans: (includeRetained = false) =>
     invoke<OrphanScan>('scan_orphans', { includeRetained }),
   cleanOrphans: (scanFingerprint: string, includeRetained = false, acknowledgeIcloudSync = false) =>

@@ -84,6 +84,8 @@ pub fn run() {
             commands::safety::safety_status,
             commands::orphans::scan_orphans,
             commands::orphans::clean_orphans,
+            commands::restore::list_snapshots,
+            commands::restore::restore_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
