@@ -1,64 +1,46 @@
 # Security TODO
 
-Open security / hardening items found during a code review. Data-loss bugs
-from the same review (orphan cleanup, delete gating, snapshots) have been
-fixed in code; the items below still need work.
+Security / hardening items found during code review, with their status.
+Data-loss bugs from the same reviews have been fixed in code.
 
-## 1. Remove risky hardened-runtime entitlements
+## 1. Done: risky hardened-runtime entitlements removed
 
-**File:** `src-tauri/entitlements.plist`
+`com.apple.security.cs.disable-library-validation` and
+`com.apple.security.cs.allow-unsigned-executable-memory` are gone from
+`src-tauri/entitlements.plist`. With Full Disk Access granted, library
+validation off would have let any dylib the process could be induced to load
+run with the app's TCC grants.
 
-The app ships with:
+**Still to verify on a Mac:** a signed, notarized build launches, exports
+and deletes normally. If something fails, re-add only the specific
+entitlement it needs and document why here.
 
-- `com.apple.security.cs.disable-library-validation`
-- `com.apple.security.cs.allow-unsigned-executable-memory`
+## 2. Done: Content Security Policy set
 
-Bubble Wrap holds Full Disk Access. With library validation disabled, any
-dylib the process can be induced to load (plugin paths, `@rpath` hijacks, a
-writable framework directory) runs with the app's TCC grants and can read all
-Messages, Contacts, Mail, etc. Unsigned executable memory further weakens
-the hardened runtime. Tauri apps do not normally need either (WebKit's JIT
-runs in a separate WebContent process).
+`src-tauri/tauri.conf.json` now sets `app.security.csp` (and `devCsp`, which
+also allows the Vite dev server's websocket): scripts only from the app
+itself (Tauri adds hashes for SvelteKit's inline bootstrap script), no
+plugins, frames, forms or `<base>` tags, and network access limited to
+Tauri's IPC. `style-src` allows inline styles because the UI uses `style`
+attributes; `dangerousDisableAssetCspModification: ["style-src"]` stops
+Tauri adding a nonce there, which would otherwise make browsers ignore
+`'unsafe-inline'`.
 
-**Fix:** delete both keys, rebuild, and verify the signed/notarized build
-still launches and exports. Only re-add an entitlement if a concrete failure
-requires it, and document why.
+Checked by serving the production build in headless Chromium with the same
+policy: the page renders with no violations, and the same harness does
+report a violation when the inline-script hash is left out.
 
-## 2. Set a Content Security Policy
+**Still to verify on a Mac:** `npm run tauri dev` and a release build show
+no CSP violations in the WebKit inspector.
 
-**File:** `src-tauri/tauri.conf.json` (`app.security.csp: null`)
+## 3. Done: `imessage-database` pinned
 
-The webview can invoke destructive commands (`run_delete`, `clean_orphans`)
-and renders attacker-influenced strings (contact names, group chat names,
-chat identifiers from incoming messages). There is no `{@html}` usage today,
-so this is not currently exploitable, but with no CSP a single future XSS
-becomes "delete the user's message history".
-
-**Fix:** set a strict CSP, e.g.
-
-```json
-"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset:; connect-src ipc: http://ipc.localhost"
-```
-
-and confirm the dev server (`devCsp`) still works.
-
-## 3. Pin the `imessage-database` dependency
-
-**Files:** `src-tauri/Cargo.toml`, `.github/workflows/ci.yml`,
-`ci_scripts/ci_post_clone.sh`
-
-- `Cargo.toml` uses an unpinned `path` dependency.
-- CI and Xcode Cloud clone the fork's `develop` branch HEAD.
-- `ci_post_clone.sh` derives the GitHub owner from the origin URL, so a
-  build from a fork clones *that* owner's `imessage-exporter`.
-
-Signed release builds can therefore silently pick up whatever is on the
-fork's `develop` at build time — a supply-chain risk for an app that holds
-Full Disk Access and deletes data.
-
-**Fix:** pin a specific commit (`git = "...", rev = "<sha>"` in
-`Cargo.toml`, `ref: <sha>` in the workflow, `git checkout <sha>` in the
-Xcode Cloud script) and hard-code the `dbpecka` owner.
+`src-tauri/Cargo.toml` now depends on the fork by git URL at an exact commit
+(`rev = "cffac6a…"`), and `Cargo.lock` records it. CI and the Xcode Cloud
+script no longer clone the fork's `develop` (or derive the owner from the
+origin URL); cargo fetches the pinned commit. Bump `rev` deliberately after
+reviewing the fork's changes. For local work on the fork, use the `[patch]`
+override described in `Cargo.toml`.
 
 ## 4. Don't publish the whole `public/` directory
 

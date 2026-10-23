@@ -17,20 +17,8 @@ jobs:
         with:
           submodules: false
 
-      # imessage-database is a sibling path dep (../../imessage-exporter).
-      # We check out the fork into that expected layout so cargo resolves
-      # the dep the same way it does locally.
-      - name: Check out imessage-exporter fork
-        uses: actions/checkout@v4
-        with:
-          repository: dbpecka/imessage-exporter
-          ref: develop
-          path: imessage-exporter-checkout
-
-      - name: Restage sibling layout
-        run: |
-          mv imessage-exporter-checkout ../imessage-exporter
-          ls -la ../imessage-exporter
+      # imessage-database is a git dependency pinned to an exact commit in
+      # src-tauri/Cargo.toml; cargo fetches it, no separate checkout needed.
 
       - uses: dtolnay/rust-toolchain@stable
         with:

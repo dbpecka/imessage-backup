@@ -15,8 +15,9 @@ pub struct SafetyStatus {
 }
 
 fn legacy_snapshot_dir() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = std::path::Path::new(&home).join("Documents/iMessage Backups/snapshots");
+    let dir = crate::core::db_path::home_dir()
+        .ok()?
+        .join("Documents/iMessage Backups/snapshots");
     std::fs::read_dir(&dir)
         .ok()?
         .next()

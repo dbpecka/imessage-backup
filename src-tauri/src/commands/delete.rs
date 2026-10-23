@@ -6,6 +6,7 @@ use imessage_database::{
     util::query_context::QueryContext,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
@@ -365,24 +366,28 @@ pub struct DeletePreview {
 #[tauri::command]
 pub async fn preview_delete(filter: FilterSpec) -> Result<DeletePreview, AppError> {
     let db_path = default_chat_db_path()?;
+    blocking(move || preview_delete_now(&db_path, &filter)).await
+}
+
+pub(crate) fn preview_delete_now(
+    db_path: &std::path::Path,
+    filter: &FilterSpec,
+) -> Result<DeletePreview, AppError> {
     let ctx = filter.to_query_context()?;
-    blocking(move || {
-        let conn = open_read(&db_path)?;
-        let BuiltPlan {
-            plan,
-            reactions: reaction_count,
-            ..
-        } = build_plan(&conn, &ctx, &db_path)?;
-        Ok(DeletePreview {
-            reaction_count,
-            message_count: plan.message_rowids.len() as u64,
-            attachment_count: plan.attachment_rowids.len() as u64,
-            attachment_bytes: plan.attachment_bytes,
-            on_disk_file_count: plan.attachment_files_on_disk.len() as u64,
-            not_on_mac_count: count_not_on_mac(&conn, &plan)?,
-        })
+    let conn = open_read(db_path)?;
+    let BuiltPlan {
+        plan,
+        reactions: reaction_count,
+        ..
+    } = build_plan(&conn, &ctx, db_path)?;
+    Ok(DeletePreview {
+        reaction_count,
+        message_count: plan.message_rowids.len() as u64,
+        attachment_count: plan.attachment_rowids.len() as u64,
+        attachment_bytes: plan.attachment_bytes,
+        on_disk_file_count: plan.attachment_files_on_disk.len() as u64,
+        not_on_mac_count: count_not_on_mac(&conn, &plan)?,
     })
-    .await
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -504,24 +509,27 @@ pub(crate) fn check_backup_gate(
 /// instead of guessing from the last backup it ran.
 #[tauri::command]
 pub async fn backup_coverage(
-    receipts: State<'_, BackupReceipts>,
+    receipts: State<'_, Arc<BackupReceipts>>,
     filter: FilterSpec,
 ) -> Result<Coverage, AppError> {
     let db_path = default_chat_db_path()?;
-    let ctx = filter.to_query_context()?;
-    let content = blocking(move || {
-        let conn = open_read(&db_path)?;
-        let fc = filter_content(&conn, &ctx, &db_path)?;
-        Ok((fc.content, fc.present))
-    })
-    .await?;
-    Ok(receipts.coverage(&filter.key(), &content.0, &content.1))
+    let receipts = Arc::clone(&receipts);
+    blocking(move || coverage_now(&db_path, &receipts, &filter)).await
 }
 
-fn ensure_messages_not_running() -> Result<(), AppError> {
-    // We err on the side of refusing when we can't tell (pgrep unavailable
-    // → treat as "could be running").
-    if is_messages_running().unwrap_or(true) {
+pub(crate) fn coverage_now(
+    db_path: &std::path::Path,
+    receipts: &BackupReceipts,
+    filter: &FilterSpec,
+) -> Result<Coverage, AppError> {
+    let ctx = filter.to_query_context()?;
+    let conn = open_read(db_path)?;
+    let fc = filter_content(&conn, &ctx, db_path)?;
+    Ok(receipts.coverage(&filter.key(), &fc.content, &fc.present))
+}
+
+fn ensure_messages_not_running(probe: &SafetyProbe) -> Result<(), AppError> {
+    if (probe.messages_running)() {
         return Err(AppError::Other(
             "Quit Messages.app before running a delete — it holds a write lock on chat.db.".into(),
         ));
@@ -589,15 +597,64 @@ fn prepare_delete(
 /// against a writable connection. Attachment files on disk are unlinked
 /// **after** the SQL transaction commits; individual unlink failures are
 /// counted but do not roll back.
+/// Host state a delete depends on. Injectable so end-to-end tests don't
+/// depend on whether Messages happens to be running on the test machine.
+pub(crate) struct SafetyProbe {
+    pub messages_running: fn() -> bool,
+    pub icloud: fn() -> ICloudState,
+}
+
+impl SafetyProbe {
+    pub fn system() -> Self {
+        Self {
+            // We err on the side of refusing when we can't tell (pgrep
+            // unavailable → treat as "could be running").
+            messages_running: || is_messages_running().unwrap_or(true),
+            icloud: || detect_icloud_messages().unwrap_or(ICloudState::Unknown),
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn run_delete(
     app: AppHandle,
-    receipts: State<'_, BackupReceipts>,
+    receipts: State<'_, Arc<BackupReceipts>>,
     lock: State<'_, OperationLock>,
     args: RunDeleteArgs,
 ) -> Result<DeleteResult, AppError> {
     let _guard = lock.try_acquire("a delete")?;
+    let db_path = default_chat_db_path()?;
+    let (snapshot_root, managed_root) = match args.snapshot_root.as_deref() {
+        Some(p) if !p.is_empty() => (
+            crate::core::paths::validate_user_path(p, "snapshot root")?,
+            false,
+        ),
+        _ => (default_snapshot_root(&app, SnapshotKind::Delete)?, true),
+    };
+    let receipts = Arc::clone(&receipts);
+    blocking(move || {
+        delete_now(
+            &db_path,
+            &receipts,
+            args,
+            &snapshot_root,
+            managed_root,
+            &SafetyProbe::system(),
+        )
+    })
+    .await
+}
 
+/// The whole delete, gates included, as a plain function (see
+/// [`run_delete`]).
+pub(crate) fn delete_now(
+    db_path: &std::path::Path,
+    receipts: &BackupReceipts,
+    args: RunDeleteArgs,
+    snapshot_root: &std::path::Path,
+    managed_root: bool,
+    probe: &SafetyProbe,
+) -> Result<DeleteResult, AppError> {
     // Gate 1: typed confirmation.
     if args.confirmation_phrase != DELETE_CONFIRMATION_PHRASE {
         return Err(AppError::Other(format!(
@@ -606,11 +663,11 @@ pub async fn run_delete(
     }
 
     // Gate 2: Messages.app must be quit.
-    ensure_messages_not_running()?;
+    ensure_messages_not_running(probe)?;
 
     // Gate 2a: Messages in iCloud. Detection is best-effort, so anything
     // other than a positive "disabled" needs an explicit acknowledgement.
-    match detect_icloud_messages().unwrap_or(ICloudState::Unknown) {
+    match (probe.icloud)() {
         ICloudState::Disabled => {}
         ICloudState::Enabled if !args.acknowledge_icloud_sync => {
             return Err(AppError::Other(format!(
@@ -628,19 +685,11 @@ pub async fn run_delete(
         _ => {}
     }
 
-    let db_path = default_chat_db_path()?;
     let ctx = args.filter.to_query_context()?;
-    let (snapshot_root, managed_root) = match args.snapshot_root.as_deref() {
-        Some(p) if !p.is_empty() => (
-            crate::core::paths::validate_user_path(p, "snapshot root")?,
-            false,
-        ),
-        _ => (default_snapshot_root(&app, SnapshotKind::Delete)?, true),
-    };
     let filter_key = args.filter.key();
     let scope = args.delete_scope;
     let expected = (args.expected_message_count, args.expected_attachment_count);
-    let prepared = blocking(move || prepare_delete(&db_path, &ctx, &scope, expected)).await?;
+    let prepared = prepare_delete(db_path, &ctx, &scope, expected)?;
 
     // Gate 3b: backup gate, against the exact content being deleted — a
     // backup of the same filter taken before newer messages arrived doesn't
@@ -660,77 +709,73 @@ pub async fn run_delete(
         )));
     }
 
-    let db_path = default_chat_db_path()?;
-    blocking(move || {
-        let Prepared {
-            plan,
-            flag_candidates,
-            ..
-        } = prepared;
+    let Prepared {
+        plan,
+        flag_candidates,
+        ..
+    } = prepared;
 
-        // Gate 4: mandatory WAL checkpoint + snapshot.
-        checkpoint_wal(&db_path)?;
-        let snapshot = snapshot_chat_db(&db_path, &snapshot_root)?;
-        if managed_root {
-            // Only ever prune the folder we own; a caller-chosen root is
-            // theirs.
-            prune_snapshots(&snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
+    // Gate 4: mandatory WAL checkpoint + snapshot.
+    checkpoint_wal(db_path)?;
+    let snapshot = snapshot_chat_db(db_path, snapshot_root)?;
+    if managed_root {
+        // Only ever prune the folder we own; a caller-chosen root is
+        // theirs.
+        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
+    }
+
+    // Re-check right before writing: the snapshot of a large chat.db
+    // can take long enough for the user to reopen Messages.
+    ensure_messages_not_running(probe)?;
+
+    // Now execute against a writable connection.
+    let mut write_conn = open_write(db_path)?;
+    let report = match execute_delete(&mut write_conn, &plan) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(AppError::Database(format!(
+                "delete transaction failed (rolled back; no changes made): {e}"
+            )));
         }
+    };
+    if let Err(e) = clear_stale_attachment_flags(&mut write_conn, &flag_candidates) {
+        eprintln!("delete: couldn't clear attachment flags on kept messages: {e:?}");
+    }
+    // Release the writable handle immediately so Messages.app can
+    // reopen.
+    drop(write_conn);
 
-        // Re-check right before writing: the snapshot of a large chat.db
-        // can take long enough for the user to reopen Messages.
-        ensure_messages_not_running()?;
-
-        // Now execute against a writable connection.
-        let mut write_conn = open_write(&db_path)?;
-        let report = match execute_delete(&mut write_conn, &plan) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(AppError::Database(format!(
-                    "delete transaction failed (rolled back; no changes made): {e}"
-                )));
-            }
-        };
-        if let Err(e) = clear_stale_attachment_flags(&mut write_conn, &flag_candidates) {
-            eprintln!("delete: couldn't clear attachment flags on kept messages: {e:?}");
+    // Unlink attachment files from disk. Failures are non-fatal — the
+    // DB is the source of truth, so a stale file on disk is a minor
+    // janitor issue, not a data-integrity event. Paths come from
+    // chat.db, so only regular files inside the Messages attachment
+    // folders are ever removed.
+    let roots = attachment_roots();
+    let mut removed = 0u64;
+    let mut failed = 0u64;
+    let mut skipped = 0u64;
+    for p in &plan.attachment_files_on_disk {
+        match remove_attachment_file(p, &roots, "delete") {
+            RemoveOutcome::Removed => removed += 1,
+            RemoveOutcome::Missing => {}
+            RemoveOutcome::Refused => skipped += 1,
+            RemoveOutcome::Failed => failed += 1,
         }
-        // Release the writable handle immediately so Messages.app can
-        // reopen.
-        drop(write_conn);
+    }
 
-        // Unlink attachment files from disk. Failures are non-fatal — the
-        // DB is the source of truth, so a stale file on disk is a minor
-        // janitor issue, not a data-integrity event. Paths come from
-        // chat.db, so only regular files inside the Messages attachment
-        // folders are ever removed.
-        let roots = attachment_roots();
-        let mut removed = 0u64;
-        let mut failed = 0u64;
-        let mut skipped = 0u64;
-        for p in &plan.attachment_files_on_disk {
-            match remove_attachment_file(p, &roots, "delete") {
-                RemoveOutcome::Removed => removed += 1,
-                RemoveOutcome::Missing => {}
-                RemoveOutcome::Refused => skipped += 1,
-                RemoveOutcome::Failed => failed += 1,
-            }
-        }
-
-        Ok(DeleteResult {
-            messages_deleted: report.messages_deleted as u64,
-            attachments_deleted: report.attachments_deleted as u64,
-            attachment_joins_deleted: report.attachment_joins_deleted as u64,
-            chat_message_joins_deleted: report.chat_message_joins_deleted as u64,
-            orphan_chats_deleted: report.orphan_chats_deleted as u64,
-            orphan_handles_deleted: report.orphan_handles_deleted as u64,
-            snapshot_path: snapshot.dir.display().to_string(),
-            on_disk_files_removed: removed,
-            on_disk_files_failed: failed,
-            on_disk_files_skipped: skipped,
-            backup_verified,
-        })
+    Ok(DeleteResult {
+        messages_deleted: report.messages_deleted as u64,
+        attachments_deleted: report.attachments_deleted as u64,
+        attachment_joins_deleted: report.attachment_joins_deleted as u64,
+        chat_message_joins_deleted: report.chat_message_joins_deleted as u64,
+        orphan_chats_deleted: report.orphan_chats_deleted as u64,
+        orphan_handles_deleted: report.orphan_handles_deleted as u64,
+        snapshot_path: snapshot.dir.display().to_string(),
+        on_disk_files_removed: removed,
+        on_disk_files_failed: failed,
+        on_disk_files_skipped: skipped,
+        backup_verified,
     })
-    .await
 }
 
 #[cfg(test)]

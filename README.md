@@ -34,10 +34,10 @@ Tauri IPC bridge
 Rust backend (src-tauri/)
   ├── commands/                 — fda, discover, preview, backup, delete, orphans, safety
   ├── core/                     — db_path, filter, contacts, icloud, snapshot, progress
-  └── imessage-database         — path dep: ../imessage-exporter (fork)
+  └── imessage-database         — git dep: dbpecka/imessage-exporter, pinned commit
 ```
 
-The Rust backend delegates all iMessage parsing and export logic to a local fork of [imessage-exporter](https://github.com/ReagentX/imessage-exporter) (`../imessage-exporter`), built with two custom feature flags:
+The Rust backend delegates all iMessage parsing and export logic to a fork of [imessage-exporter](https://github.com/ReagentX/imessage-exporter) ([dbpecka/imessage-exporter](https://github.com/dbpecka/imessage-exporter), pinned to an exact commit in `src-tauri/Cargo.toml`), built with two custom feature flags:
 
 - `export` — enables the HTML/TXT/JSON/PDF export runtime
 - `write` — enables destructive SQL operations (two-phase delete planning and execution)
@@ -96,7 +96,7 @@ iCloud Messages sync state is detected via `defaults read com.apple.Messages ICl
 
 - Rust (stable)
 - Node.js + npm
-- The `imessage-exporter` fork checked out at `../imessage-exporter` on the `develop` branch
+- Nothing else: cargo fetches the pinned `imessage-exporter` fork itself. To work on the fork locally, see the `[patch]` note in `src-tauri/Cargo.toml`.
 
 ### Run in development
 
@@ -117,6 +117,17 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 # Frontend side
 npm run check
+```
+
+The suite includes end-to-end tests (`src-tauri/src/e2e_tests.rs`) that run
+backup → delete → orphan cleanup against a throwaway home folder whose
+`chat.db` uses Apple's real schema and triggers
+(`src-tauri/tests/fixtures/chat-db-schema.sql`). They never touch your real
+Messages data.
+
+```sh
+# just the end-to-end tests
+cargo test --manifest-path src-tauri/Cargo.toml --lib e2e
 ```
 
 ### Build
@@ -158,7 +169,7 @@ src-tauri/
       progress.rs          — TauriProgress: ProgressReporter → Tauri events
       snapshot.rs          — WAL checkpoint + timestamped file copy
 
-../imessage-exporter/      — sibling fork (path dependency)
+dbpecka/imessage-exporter  — the fork (git dependency, pinned)
   imessage-database/
     src/exporters/         — html, txt, json, pdf export engines
     src/tables/write/      — delete.rs (two-phase plan + execute), orphans.rs

@@ -3,7 +3,7 @@ use imessage_database::util::query_context::QueryContext;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterSpec {
     pub date_range: Option<DateRange>,
@@ -15,14 +15,14 @@ pub struct FilterSpec {
     pub attachments: Option<AttachmentFilterSpec>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DateRange {
     pub start: Option<String>,
     pub end: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct AttachmentFilterSpec {
