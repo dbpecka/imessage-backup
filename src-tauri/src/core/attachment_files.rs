@@ -19,6 +19,16 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// `roots` with symlinks resolved where they exist (e.g. macOS's `/var` →
+/// `/private/var`). Everything that compares a resolved path against the
+/// roots resolves the roots too, so callers can pass them either way.
+pub fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|r| fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
+        .collect()
+}
+
 /// The attachment folders, with symlinks resolved when they exist, so
 /// walked paths and normalised chat.db paths compare like for like.
 pub fn attachment_roots() -> Vec<PathBuf> {
@@ -85,6 +95,7 @@ pub enum RemoveOutcome {
 /// `roots`. chat.db is the source of these paths; a row pointing somewhere
 /// else on disk must never turn into deleting an unrelated file.
 pub fn remove_attachment_file(path: &Path, roots: &[PathBuf], context: &str) -> RemoveOutcome {
+    let roots = &canonical_roots(roots);
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RemoveOutcome::Missing,
