@@ -106,10 +106,29 @@ pub fn checkpoint_wal(chat_db: &Path) -> Result<(), AppError> {
 /// What a snapshot was taken for. Each kind gets its own folder and is
 /// pruned on its own, so routine orphan cleanups can never push out the
 /// snapshot taken before a message delete.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SnapshotKind {
     Delete,
     OrphanClean,
+    /// The live database just before a restore, so a restore can be undone.
+    PreRestore,
+}
+
+impl SnapshotKind {
+    pub const ALL: [SnapshotKind; 3] = [
+        SnapshotKind::Delete,
+        SnapshotKind::OrphanClean,
+        SnapshotKind::PreRestore,
+    ];
+
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            SnapshotKind::Delete => "delete",
+            SnapshotKind::OrphanClean => "orphan-clean",
+            SnapshotKind::PreRestore => "pre-restore",
+        }
+    }
 }
 
 /// Default snapshot root: `<app data dir>/snapshots/<kind>`, i.e.
@@ -125,11 +144,7 @@ pub fn default_snapshot_root(
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Other(format!("cannot locate app data directory: {e}")))?;
-    let sub = match kind {
-        SnapshotKind::Delete => "delete",
-        SnapshotKind::OrphanClean => "orphan-clean",
-    };
-    Ok(dir.join("snapshots").join(sub))
+    Ok(dir.join("snapshots").join(kind.dir_name()))
 }
 
 /// How many snapshots [`prune_snapshots`] keeps per default root.
@@ -178,6 +193,59 @@ type SortKey = (std::time::SystemTime, String, u32);
 
 /// For a snapshot folder name (`YYYY-MM-DDTHH-MM-SS` plus an optional
 /// `-N`), the numeric suffix (0 if none); `None` for other names.
+/// A snapshot folder found on disk.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInfo {
+    pub path: String,
+    pub kind: SnapshotKind,
+    /// When its chat.db was written, in Unix seconds.
+    pub taken_at_unix: u64,
+    pub bytes: u64,
+}
+
+/// Every snapshot this app created under the given per-kind roots, newest
+/// first.
+pub fn list_snapshots(roots: &[(SnapshotKind, PathBuf)]) -> Vec<SnapshotInfo> {
+    let mut out = Vec::new();
+    for (kind, root) in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(snapshot_suffix)
+                .is_some();
+            let Ok(meta) = fs::metadata(path.join("chat.db")) else {
+                continue;
+            };
+            if !named || !entry.file_type().is_ok_and(|t| t.is_dir()) || !meta.is_file() {
+                continue;
+            }
+            let taken_at_unix = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            out.push(SnapshotInfo {
+                path: path.display().to_string(),
+                kind: *kind,
+                taken_at_unix,
+                bytes: meta.len(),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.taken_at_unix
+            .cmp(&a.taken_at_unix)
+            .then(b.path.cmp(&a.path))
+    });
+    out
+}
+
 fn snapshot_suffix(name: &str) -> Option<u32> {
     if !is_snapshot_name(name) {
         return None;

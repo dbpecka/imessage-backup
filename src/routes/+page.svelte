@@ -16,6 +16,8 @@
     type DeletePreview,
     type DeleteResult,
     type BackupCoverage,
+    type SnapshotInfo,
+    type RestoreResult,
     type DeleteScope,
     type OrphanScan,
     type OrphanCleanResult,
@@ -504,6 +506,62 @@
     }
   }
 
+  // Snapshots that can be restored (undo a delete or cleanup).
+  let snapshots = $state<SnapshotInfo[] | null>(null);
+  let restoring = $state(false);
+  let restoreError = $state('');
+  let restoreResult = $state<RestoreResult | null>(null);
+
+  async function loadSnapshots() {
+    try {
+      snapshots = await api.listSnapshots();
+    } catch (err) {
+      restoreError = appErrorMessage(err);
+    }
+  }
+
+  const snapshotKindLabel: Record<SnapshotInfo['kind'], string> = {
+    delete: 'Before a delete',
+    orphanClean: 'Before an orphan cleanup',
+    preRestore: 'Before a restore'
+  };
+
+  async function restoreSnapshot(snap: SnapshotInfo) {
+    restoreError = '';
+    restoreResult = null;
+    const ok = await refreshSafety();
+    if (!ok) return;
+    if (safety?.messagesRunning) {
+      restoreError = 'Quit the Messages app before restoring.';
+      return;
+    }
+    const when = new Date(snap.takenAtUnix * 1000).toLocaleString();
+    const icloudOn = safety?.icloudMessages !== 'disabled';
+    const confirmed = await confirm(
+      `Restore the Messages database to how it was on ${when}?\n\n` +
+        'Messages received on this Mac since then will be removed from it. Attachment files ' +
+        "deleted since then aren't in the snapshot and stay deleted (restore them from your " +
+        'backup). The current database is saved first, so you can undo this.' +
+        (icloudOn
+          ? '\n\nMessages in iCloud may be on: how iCloud reconciles a database rolled back ' +
+            'underneath it is unpredictable.'
+          : ''),
+      { title: 'Restore Snapshot', kind: 'warning' }
+    );
+    if (!confirmed) return;
+    restoring = true;
+    try {
+      // The dialog above named the iCloud risk when it applied, so OK is
+      // the user's explicit acknowledgement of it.
+      restoreResult = await api.restoreSnapshot(snap.path, icloudOn);
+      await Promise.all([loadSnapshots(), runPreview(), runDeletePreview(), loadChats()]);
+    } catch (err) {
+      restoreError = appErrorMessage(err);
+    } finally {
+      restoring = false;
+    }
+  }
+
   async function expandDelete() {
     deleteError = '';
     const ok = await refreshSafety();
@@ -513,6 +571,7 @@
       return;
     }
     deleteExpanded = true;
+    void loadSnapshots();
   }
 
   async function runDeletePreview() {
@@ -634,7 +693,7 @@
       skipBackupAcknowledged = false;
       notOnMacAcknowledged = false;
       typedConfirmation = '';
-      await Promise.all([runPreview(), runDeletePreview(), loadChats()]);
+      await Promise.all([runPreview(), runDeletePreview(), loadChats(), loadSnapshots()]);
     } catch (err) {
       deleteError = appErrorMessage(err);
       // The backend refuses when what it would delete no longer matches the
@@ -1379,13 +1438,47 @@
             </li>
           </ul>
           <p class="meta">
-            To undo, quit Messages, replace <code>~/Library/Messages/chat.db</code> with the
-            <code>chat.db</code> in the snapshot folder, and delete <code>chat.db-wal</code> and
-            <code>chat.db-shm</code> next to it. Deleted attachment files aren't in the snapshot —
-            restore them from your backup.
+            To undo, use “Restore a snapshot” below. Deleted attachment files aren't in the
+            snapshot — restore them from your backup.
           </p>
         </div>
       {/if}
+
+      <div class="restore">
+        <h3>Restore a snapshot</h3>
+        <p class="meta">
+          A copy of the Messages database is saved before every delete and cleanup. Restoring one
+          brings back the messages it holds; attachment files come back only from your backup.
+        </p>
+        {#if snapshots === null}
+          <p class="meta">Loading…</p>
+        {:else if snapshots.length === 0}
+          <p class="meta">No snapshots yet.</p>
+        {:else}
+          <ul class="snapshot-list">
+            {#each snapshots as snap (snap.path)}
+              <li>
+                <span>
+                  <strong>{new Date(snap.takenAtUnix * 1000).toLocaleString()}</strong>
+                  · {snapshotKindLabel[snap.kind]} · {formatBytes(snap.bytes)}
+                </span>
+                <button onclick={() => restoreSnapshot(snap)} disabled={restoring || deleting}>
+                  {restoring ? 'Restoring…' : 'Restore'}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if restoreError}
+          <p class="err">{restoreError}</p>
+        {/if}
+        {#if restoreResult}
+          <p class="ok">
+            Restored. The database from just before the restore was saved too (listed above as
+            “Before a restore”), so you can undo this. Reopen Messages to see the result.
+          </p>
+        {/if}
+      </div>
     {/if}
   </section>
 
@@ -1914,6 +2007,33 @@
     font-size: 15px;
     font-weight: 600;
     letter-spacing: -0.01em;
+  }
+
+  .restore {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  }
+
+  .restore h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+
+  .snapshot-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .snapshot-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
   }
 
   .orphan-rows {

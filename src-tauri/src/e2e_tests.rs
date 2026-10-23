@@ -936,3 +936,114 @@ fn backup_and_delete_refuse_up_front_when_the_disk_is_full() {
         "nothing deleted"
     );
 }
+
+fn snapshot_roots(env: &Env) -> Vec<(crate::core::snapshot::SnapshotKind, PathBuf)> {
+    use crate::core::snapshot::SnapshotKind;
+    vec![
+        (SnapshotKind::Delete, env.home.join("snapshots")),
+        (SnapshotKind::OrphanClean, env.home.join("orphan-snapshots")),
+        (SnapshotKind::PreRestore, env.home.join("pre-restore")),
+    ]
+}
+
+fn restore(
+    env: &Env,
+    snapshot: &str,
+    probe: &SafetyProbe,
+) -> Result<crate::commands::restore::RestoreResult, AppError> {
+    crate::commands::restore::restore_now(
+        &env.db,
+        &snapshot_roots(env),
+        &crate::commands::restore::RestoreArgs {
+            snapshot_path: snapshot.into(),
+            acknowledge_icloud_sync: false,
+        },
+        probe,
+    )
+}
+
+#[test]
+fn restore_brings_back_deleted_messages_and_can_itself_be_undone() {
+    let env = Env::new();
+    let r = env.delete(chat(2), DeleteScope::Both, true).unwrap();
+    assert_eq!(env.count("SELECT COUNT(*) FROM message"), 3);
+
+    let listed = crate::core::snapshot::list_snapshots(&snapshot_roots(&env));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, crate::core::snapshot::SnapshotKind::Delete);
+
+    let restored = restore(&env, &r.snapshot_path, &quiet_mac()).unwrap();
+    assert_eq!(env.count("SELECT COUNT(*) FROM message"), 5);
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM attachment WHERE ROWID = 4"),
+        1
+    );
+
+    // The state just before the restore was kept, and restoring it undoes
+    // the restore.
+    let pre = Connection::open(Path::new(&restored.pre_restore_snapshot).join("chat.db")).unwrap();
+    let n: i64 = pre
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3);
+    drop(pre);
+    restore(&env, &restored.pre_restore_snapshot, &quiet_mac()).unwrap();
+    assert_eq!(env.count("SELECT COUNT(*) FROM message"), 3);
+}
+
+#[test]
+fn restore_refuses_anything_that_isnt_one_of_our_snapshots() {
+    let env = Env::new();
+    // A folder that looks like a snapshot but lives elsewhere.
+    let elsewhere = env.home.join("Downloads/2024-01-01T00-00-00");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::copy(&env.db, elsewhere.join("chat.db")).unwrap();
+    let err = restore(&env, elsewhere.to_str().unwrap(), &quiet_mac()).unwrap_err();
+    assert!(matches!(err, AppError::Other(m) if m.contains("isn't a Bubble Wrap snapshot")));
+    // The live database itself.
+    assert!(restore(
+        &env,
+        env.db.parent().unwrap().to_str().unwrap(),
+        &quiet_mac()
+    )
+    .is_err());
+    assert_eq!(env.count("SELECT COUNT(*) FROM message"), 5);
+}
+
+#[test]
+fn restore_refuses_a_damaged_snapshot() {
+    let env = Env::new();
+    let r = env.delete(chat(2), DeleteScope::Both, true).unwrap();
+    let snap_db = Path::new(&r.snapshot_path).join("chat.db");
+    // Corrupt it past the header.
+    let mut bytes = fs::read(&snap_db).unwrap();
+    for b in bytes.iter_mut().skip(4096).take(8192) {
+        *b = 0xAB;
+    }
+    fs::write(&snap_db, bytes).unwrap();
+    let _ = fs::remove_file(Path::new(&r.snapshot_path).join("chat.db-wal"));
+    assert!(restore(&env, &r.snapshot_path, &quiet_mac()).is_err());
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM message"),
+        3,
+        "live db untouched"
+    );
+}
+
+#[test]
+fn restore_refuses_while_messages_runs_or_without_icloud_ack() {
+    let env = Env::new();
+    let r = env.delete(chat(2), DeleteScope::Both, true).unwrap();
+    let running = SafetyProbe {
+        messages_running: || true,
+        ..quiet_mac()
+    };
+    assert!(restore(&env, &r.snapshot_path, &running).is_err());
+    let icloud = SafetyProbe {
+        icloud: || ICloudState::Enabled,
+        ..quiet_mac()
+    };
+    let err = restore(&env, &r.snapshot_path, &icloud).unwrap_err();
+    assert!(matches!(err, AppError::Other(m) if m.contains("iCloud")));
+    assert_eq!(env.count("SELECT COUNT(*) FROM message"), 3);
+}
