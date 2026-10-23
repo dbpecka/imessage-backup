@@ -1,18 +1,99 @@
-#![cfg(target_os = "macos")]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rusqlite::{Connection, OpenFlags};
 
-/// Fetch contacts from all local AddressBook sources and return a map of
-/// normalized phone/email → display name.
+/// Phone numbers are matched on their last this-many digits when an exact
+/// match fails, so a contact saved in national format (`07700 900123`)
+/// still matches the international handle (`+447700900123`).
+const PHONE_SUFFIX_LEN: usize = 9;
+
+/// Normalized phone/email → display name.
+#[derive(Debug, Default)]
+pub struct ContactMap {
+    exact: HashMap<String, String>,
+    /// Last [`PHONE_SUFFIX_LEN`] digits → name, or `None` when different
+    /// contacts share that suffix (ambiguous, so never used).
+    suffix: HashMap<String, Option<String>>,
+}
+
+impl ContactMap {
+    fn insert_phone(&mut self, phone: &str, name: &str) {
+        let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return;
+        }
+        for key in phone_lookup_keys(&digits) {
+            self.exact.entry(key).or_insert_with(|| name.to_string());
+        }
+        if let Some(sfx) = phone_suffix(&digits) {
+            self.suffix
+                .entry(sfx)
+                .and_modify(|existing| {
+                    if existing.as_deref() != Some(name) {
+                        *existing = None;
+                    }
+                })
+                .or_insert_with(|| Some(name.to_string()));
+        }
+    }
+
+    fn insert_email(&mut self, email: &str, name: &str) {
+        let email_lower = email.trim().to_lowercase();
+        if !email_lower.is_empty() {
+            self.exact
+                .entry(email_lower)
+                .or_insert_with(|| name.to_string());
+        }
+    }
+
+    /// Resolve a Messages `chat_identifier` / handle (phone or email) to a
+    /// contact name.
+    pub fn lookup(&self, identifier: &str) -> Option<String> {
+        let id = identifier.strip_prefix("tel:").unwrap_or(identifier).trim();
+
+        if id.contains('@') {
+            return self.exact.get(&id.to_lowercase()).cloned();
+        }
+
+        // Only treat it as a phone number if it looks like one. Group chats
+        // use opaque identifiers like `chat123456789`, whose digits must not
+        // be matched against contacts' numbers.
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')' | '.'))
+        {
+            return None;
+        }
+        let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+
+        for key in phone_lookup_keys(&digits) {
+            if let Some(name) = self.exact.get(&key) {
+                return Some(name.clone());
+            }
+        }
+        phone_suffix(&digits)
+            .and_then(|sfx| self.suffix.get(&sfx))
+            .and_then(|n| n.clone())
+    }
+}
+
+fn phone_suffix(digits: &str) -> Option<String> {
+    (digits.len() >= PHONE_SUFFIX_LEN)
+        .then(|| digits[digits.len() - PHONE_SUFFIX_LEN..].to_string())
+}
+
+/// Fetch contacts from all local AddressBook sources.
 ///
 /// Uses Full Disk Access (already required by the app) to read the
 /// AddressBook SQLite databases directly. No separate Contacts TCC
 /// permission is needed.
-pub fn fetch_contact_map() -> HashMap<String, String> {
-    let mut map = HashMap::new();
+pub fn fetch_contact_map() -> ContactMap {
+    let mut map = ContactMap::default();
     for path in addressbook_db_paths() {
         if !path.exists() {
             continue;
@@ -45,7 +126,7 @@ fn addressbook_db_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn load_phones(conn: &Connection, map: &mut HashMap<String, String>) {
+fn load_phones(conn: &Connection, map: &mut ContactMap) {
     let mut stmt = match conn.prepare(
         "SELECT r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION, p.ZFULLNUMBER
          FROM ZABCDRECORD r
@@ -78,16 +159,11 @@ fn load_phones(conn: &Connection, map: &mut HashMap<String, String>) {
         ) else {
             continue;
         };
-        let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            for key in phone_lookup_keys(&digits) {
-                map.entry(key).or_insert_with(|| name.clone());
-            }
-        }
+        map.insert_phone(&phone, &name);
     }
 }
 
-fn load_emails(conn: &Connection, map: &mut HashMap<String, String>) {
+fn load_emails(conn: &Connection, map: &mut ContactMap) {
     let mut stmt = match conn.prepare(
         "SELECT r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION, e.ZADDRESS
          FROM ZABCDRECORD r
@@ -120,10 +196,7 @@ fn load_emails(conn: &Connection, map: &mut HashMap<String, String>) {
         ) else {
             continue;
         };
-        let email_lower = email.to_lowercase();
-        if !email_lower.is_empty() {
-            map.entry(email_lower).or_insert_with(|| name.clone());
-        }
+        map.insert_email(&email, &name);
     }
 }
 
@@ -161,23 +234,50 @@ fn phone_lookup_keys(digits: &str) -> Vec<String> {
     keys
 }
 
-/// Resolve a Messages `chat_identifier` (phone or email) to a contact name.
-pub fn lookup_contact_name(identifier: &str, map: &HashMap<String, String>) -> Option<String> {
-    let id = identifier.strip_prefix("tel:").unwrap_or(identifier);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if id.contains('@') {
-        return map.get(&id.to_lowercase()).cloned();
+    fn map() -> ContactMap {
+        let mut m = ContactMap::default();
+        m.insert_phone("(555) 123-4567", "Ana US");
+        m.insert_phone("07700 900123", "Ben UK");
+        m.insert_email("Cara@Example.com", "Cara");
+        m
     }
 
-    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
+    #[test]
+    fn matches_us_numbers_with_or_without_country_code() {
+        let m = map();
+        assert_eq!(m.lookup("+15551234567").as_deref(), Some("Ana US"));
+        assert_eq!(m.lookup("tel:5551234567").as_deref(), Some("Ana US"));
     }
 
-    for key in phone_lookup_keys(&digits) {
-        if let Some(name) = map.get(&key) {
-            return Some(name.clone());
-        }
+    #[test]
+    fn matches_national_format_against_international_handle() {
+        assert_eq!(map().lookup("+447700900123").as_deref(), Some("Ben UK"));
     }
-    None
+
+    #[test]
+    fn emails_are_case_insensitive() {
+        assert_eq!(map().lookup("cara@example.COM").as_deref(), Some("Cara"));
+    }
+
+    #[test]
+    fn group_chat_identifiers_never_match_numbers() {
+        let mut m = map();
+        m.insert_phone("123456789012", "Digits Person");
+        assert_eq!(m.lookup("chat123456789012"), None);
+    }
+
+    #[test]
+    fn ambiguous_suffixes_are_not_used() {
+        let mut m = ContactMap::default();
+        m.insert_phone("+44 7700 900123", "One");
+        m.insert_phone("+61 7700 900123", "Two");
+        // Exact matches still work…
+        assert_eq!(m.lookup("+447700900123").as_deref(), Some("One"));
+        // …but a third number sharing only the suffix resolves to nobody.
+        assert_eq!(m.lookup("+3307700900123"), None);
+    }
 }

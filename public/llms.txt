@@ -8,7 +8,7 @@ Bubble Wrap lets Mac users export their iMessage conversations — messages, pho
 
 - **Export messages**: Save iMessage conversations as HTML pages, PDFs, plain text files, or JSON
 - **Save attachments**: Photos, voice memos, and files are copied to a local folder alongside messages
-- **Filter by date or contact**: Choose any date range and specific conversations to back up
+- **Filter by date or conversation**: Choose any date range and specific conversations to back up
 - **Preview before deleting**: See the exact count of messages and files affected before anything changes
 - **Reclaim disk space**: Remove old messages and attachments from the Mac's Messages database after a successful backup
 - **Real names**: Contacts appear with names from your address book, not raw phone numbers or email addresses
@@ -21,11 +21,14 @@ Bubble Wrap lets Mac users export their iMessage conversations — messages, pho
 
 ## Safety model
 
-Bubble Wrap uses a three-step safety process before any deletion runs:
+Bubble Wrap uses a multi-step safety process before any deletion runs:
 
 1. **Preview first** — Shows the exact count of messages and files that will be affected
-2. **Automatic snapshot** — Saves a complete copy of the Messages database to your Documents folder
-3. **Typed confirmation** — Requires you to type a confirmation word; no accidental clicks
+2. **Backup check** — Confirms a backup holds exactly the messages and attachment files being deleted (PDF exports don't count: they can't store emoji or non-Latin text)
+3. **Automatic snapshot** — Saves a copy of the Messages database in the app's own folder (`~/Library/Application Support`); it covers the database only, so deleted attachment files are restored from the backup
+4. **Typed confirmation** — Requires you to type DELETE; no accidental clicks
+
+If Messages in iCloud is on, deletions are expected to sync to iCloud and your other devices.
 
 ## Technical details
 
