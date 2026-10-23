@@ -50,6 +50,7 @@ fn quiet_mac() -> SafetyProbe {
     SafetyProbe {
         messages_running: || false,
         icloud: || ICloudState::Disabled,
+        available_space: crate::core::space::system_available,
     }
 }
 
@@ -223,6 +224,7 @@ impl Env {
                 copy_attachments: true,
             },
             &NoopProgress,
+            crate::core::space::system_available,
         )
         .unwrap()
     }
@@ -688,6 +690,7 @@ fn failed_delete_attempts_keep_the_earlier_rollback_snapshot() {
             &SafetyProbe {
                 messages_running: reopens,
                 icloud: || ICloudState::Disabled,
+                available_space: crate::core::space::system_available,
             },
         );
         assert!(r.is_err());
@@ -744,6 +747,7 @@ fn orphan_clean_requires_icloud_acknowledgement() {
     let icloud_on = SafetyProbe {
         messages_running: || false,
         icloud: || ICloudState::Enabled,
+        available_space: crate::core::space::system_available,
     };
     let err = scan_and_clean(&env, false, &icloud_on).unwrap_err();
     assert!(matches!(err, AppError::Other(m) if m.contains("iCloud")));
@@ -870,4 +874,65 @@ fn folder_attachment_is_copied_whole_in_json_backups() {
     // The backup now vouches for the folder, so the delete is verified.
     let cov = coverage_now(&env.db, &env.receipts, &chat(2)).unwrap();
     assert!(cov.with_attachments);
+}
+
+#[test]
+fn backup_and_delete_refuse_up_front_when_the_disk_is_full() {
+    let env = Env::new();
+    let almost_full: crate::core::space::SpaceProbe = |_| Ok(1024);
+    let err = backup_now(
+        &env.db,
+        &env.receipts,
+        RunBackupArgs {
+            filter: chat(1),
+            format: "json".into(),
+            destination: env.home.join("Backups").display().to_string(),
+            copy_attachments: true,
+        },
+        &NoopProgress,
+        almost_full,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Other(m) if m.contains("Not enough free space")),
+        "{err:?}"
+    );
+    // Nothing half-written was left behind.
+    assert!(
+        !env.home.join("Backups").exists()
+            || fs::read_dir(env.home.join("Backups")).unwrap().count() == 0
+    );
+
+    let p = env.preview(&chat(2));
+    let err = delete_now(
+        &env.db,
+        &env.receipts,
+        RunDeleteArgs {
+            filter: chat(2),
+            confirmation_phrase: DELETE_CONFIRMATION_PHRASE.into(),
+            acknowledge_skip_backup: true,
+            snapshot_root: None,
+            delete_scope: DeleteScope::Both,
+            acknowledge_icloud_sync: false,
+            acknowledge_not_on_mac: false,
+            expected_message_count: Some(p.message_count),
+            expected_attachment_count: Some(p.attachment_count),
+        },
+        &env.home.join("snapshots"),
+        true,
+        &SafetyProbe {
+            available_space: almost_full,
+            ..quiet_mac()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Other(m) if m.contains("safety snapshot")),
+        "{err:?}"
+    );
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM message"),
+        5,
+        "nothing deleted"
+    );
 }

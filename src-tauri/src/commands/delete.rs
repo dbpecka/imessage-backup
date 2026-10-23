@@ -25,6 +25,7 @@ use crate::core::snapshot::{
     checkpoint_wal, default_snapshot_root, prune_snapshots, snapshot_chat_db, SnapshotKind,
     SNAPSHOTS_TO_KEEP,
 };
+use crate::core::space::{ensure_space, snapshot_size, SpaceProbe};
 use crate::error::AppError;
 
 pub const DELETE_CONFIRMATION_PHRASE: &str = "DELETE";
@@ -631,6 +632,7 @@ fn prepare_delete(
 pub(crate) struct SafetyProbe {
     pub messages_running: fn() -> bool,
     pub icloud: fn() -> ICloudState,
+    pub available_space: SpaceProbe,
 }
 
 impl SafetyProbe {
@@ -640,6 +642,7 @@ impl SafetyProbe {
             // unavailable → treat as "could be running").
             messages_running: || is_messages_running().unwrap_or(true),
             icloud: || detect_icloud_messages().unwrap_or(ICloudState::Unknown),
+            available_space: crate::core::space::system_available,
         }
     }
 }
@@ -744,7 +747,14 @@ pub(crate) fn delete_now(
         ..
     } = prepared;
 
-    // Gate 4: mandatory WAL checkpoint + snapshot.
+    // Gate 4: mandatory WAL checkpoint + snapshot — refused up front if
+    // the snapshot folder's volume can't hold it.
+    ensure_space(
+        snapshot_root,
+        snapshot_size(db_path),
+        "the safety snapshot",
+        probe.available_space,
+    )?;
     checkpoint_wal(db_path)?;
     let snapshot = snapshot_chat_db(db_path, snapshot_root)?;
 

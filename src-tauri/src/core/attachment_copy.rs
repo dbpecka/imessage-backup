@@ -345,7 +345,7 @@ pub fn verify_runtime_copies(
 
 /// Size of an attachment source: a file's length, or the total of a
 /// folder's files. `None` if it isn't on this Mac.
-fn source_size(src: &Path) -> Option<u64> {
+pub(crate) fn source_size(src: &Path) -> Option<u64> {
     let meta = fs::metadata(src).ok()?;
     if meta.is_dir() {
         let mut files = Vec::new();

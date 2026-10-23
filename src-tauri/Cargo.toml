@@ -26,6 +26,7 @@ thiserror = "2.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-util = "0.7"
 chrono = "0.4"
+fs2 = "0.4"
 
 # Library crate from the fork (dbpecka/imessage-exporter), pinned to an exact
 # commit so a signed build can't silently pick up whatever is on `develop`.
