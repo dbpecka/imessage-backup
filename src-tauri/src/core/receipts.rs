@@ -76,6 +76,9 @@ struct Receipt {
     filter: FilterKey,
     /// What the filter matched when the backup started.
     content: ContentFingerprint,
+    /// The attachments whose files were actually copied. Files that
+    /// weren't on the Mac then (and were downloaded later) aren't in it.
+    copied: ContentFingerprint,
     includes_attachments: bool,
     /// The run's output folder. A receipt only counts while this still
     /// exists — a deleted backup protects nothing.
@@ -101,6 +104,7 @@ impl BackupReceipts {
         &self,
         filter: FilterKey,
         content: ContentFingerprint,
+        copied: ContentFingerprint,
         includes_attachments: bool,
         export_path: &Path,
     ) {
@@ -108,6 +112,7 @@ impl BackupReceipts {
         g.push(Receipt {
             filter,
             content,
+            copied,
             includes_attachments,
             export_path: export_path.to_path_buf(),
         });
@@ -121,21 +126,28 @@ impl BackupReceipts {
     }
 
     /// Whether a successful backup with this filter, of exactly this
-    /// content, still exists on disk.
-    pub fn coverage(&self, filter: &FilterKey, content: &ContentFingerprint) -> Coverage {
+    /// content, still exists on disk — and whether it holds a copy of every
+    /// attachment file that is on this Mac now (`present`).
+    pub fn coverage(
+        &self,
+        filter: &FilterKey,
+        content: &ContentFingerprint,
+        present: &ContentFingerprint,
+    ) -> Coverage {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let matching = || {
             g.iter()
                 .rev()
                 .filter(|r| &r.filter == filter && &r.content == content && r.export_path.is_dir())
         };
+        let has_files = |r: &Receipt| r.includes_attachments && &r.copied == present;
         let best = matching()
-            .find(|r| r.includes_attachments)
+            .find(|r| has_files(r))
             .or_else(|| matching().next());
         match best {
             Some(r) => Coverage {
                 covered: true,
-                with_attachments: r.includes_attachments,
+                with_attachments: has_files(r),
                 export_path: Some(r.export_path.display().to_string()),
             },
             None => Coverage::default(),
@@ -158,20 +170,44 @@ mod tests {
     use crate::core::filter::FilterSpec;
     use tempfile::TempDir;
 
+    fn files(ids: &[i64]) -> ContentFingerprint {
+        ContentFingerprint::of(&[], ids)
+    }
+
     #[test]
     fn coverage_requires_matching_filter_content_and_attachments() {
         let tmp = TempDir::new().unwrap();
         let receipts = BackupReceipts::default();
         let key = FilterSpec::default().key();
         let content = ContentFingerprint::of(&[1, 2], &[10]);
-        assert!(!receipts.coverage(&key, &content).covered);
+        let present = files(&[10]);
+        assert!(!receipts.coverage(&key, &content, &present).covered);
 
-        receipts.record(key.clone(), content, false, tmp.path());
-        let c = receipts.coverage(&key, &content);
+        receipts.record(key.clone(), content, files(&[]), false, tmp.path());
+        let c = receipts.coverage(&key, &content, &present);
         assert!(c.covered && !c.with_attachments);
 
-        receipts.record(key.clone(), content, true, tmp.path());
-        assert!(receipts.coverage(&key, &content).with_attachments);
+        receipts.record(key.clone(), content, files(&[10]), true, tmp.path());
+        assert!(receipts.coverage(&key, &content, &present).with_attachments);
+    }
+
+    #[test]
+    fn files_downloaded_after_the_backup_are_not_covered() {
+        let tmp = TempDir::new().unwrap();
+        let receipts = BackupReceipts::default();
+        let key = FilterSpec::default().key();
+        let content = ContentFingerprint::of(&[1], &[10, 11]);
+        // At backup time only attachment 10 was on the Mac (11 was in iCloud).
+        receipts.record(key.clone(), content, files(&[10]), true, tmp.path());
+        assert!(
+            receipts
+                .coverage(&key, &content, &files(&[10]))
+                .with_attachments
+        );
+
+        // The user downloads 11; the backup doesn't have it.
+        let c = receipts.coverage(&key, &content, &files(&[10, 11]));
+        assert!(c.covered && !c.with_attachments);
     }
 
     #[test]
@@ -179,27 +215,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let receipts = BackupReceipts::default();
         let key = FilterSpec::default().key();
+        let f = files(&[10]);
         receipts.record(
             key.clone(),
             ContentFingerprint::of(&[1, 2], &[10]),
+            f,
             true,
             tmp.path(),
         );
         // Same filter, but a message (or attachment) arrived afterwards.
         assert!(
             !receipts
-                .coverage(&key, &ContentFingerprint::of(&[1, 2, 3], &[10]))
+                .coverage(&key, &ContentFingerprint::of(&[1, 2, 3], &[10]), &f)
                 .covered
         );
         assert!(
             !receipts
-                .coverage(&key, &ContentFingerprint::of(&[1, 2], &[10, 11]))
+                .coverage(&key, &ContentFingerprint::of(&[1, 2], &[10, 11]), &f)
                 .covered
         );
         // Order doesn't matter.
         assert!(
             receipts
-                .coverage(&key, &ContentFingerprint::of(&[2, 1], &[10]))
+                .coverage(&key, &ContentFingerprint::of(&[2, 1], &[10]), &f)
                 .covered
         );
     }
@@ -220,12 +258,13 @@ mod tests {
         fs::create_dir_all(&export).unwrap();
         let key = FilterSpec::default().key();
         let content = ContentFingerprint::of(&[1], &[]);
+        let f = files(&[]);
 
-        BackupReceipts::persistent(file.clone()).record(key.clone(), content, true, &export);
+        BackupReceipts::persistent(file.clone()).record(key.clone(), content, f, true, &export);
         let reloaded = BackupReceipts::persistent(file.clone());
-        assert!(reloaded.coverage(&key, &content).with_attachments);
+        assert!(reloaded.coverage(&key, &content, &f).with_attachments);
 
         fs::remove_dir_all(&export).unwrap();
-        assert!(!reloaded.coverage(&key, &content).covered);
+        assert!(!reloaded.coverage(&key, &content, &f).covered);
     }
 }

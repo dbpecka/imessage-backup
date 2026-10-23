@@ -623,13 +623,14 @@
     }
   }
 
-  const deleteScope = $derived<DeleteScope>(
-    deleteMessages && deleteAttachments
-      ? 'both'
-      : deleteMessages
-        ? 'messages_only'
-        : 'attachments_only'
-  );
+  // Deleting a message always deletes its attachments: chat.db's own
+  // triggers remove an attachment's record when its last message goes, so
+  // "keep the attachments" would only leave untracked files behind.
+  $effect(() => {
+    if (deleteMessages) deleteAttachments = true;
+  });
+
+  const deleteScope = $derived<DeleteScope>(deleteMessages ? 'both' : 'attachments_only');
 
   async function startOrphanScan(includeRetained = false) {
     orphanIncludeRetained = includeRetained;
@@ -1137,20 +1138,21 @@
       {/if}
       {#if safety?.icloudMessages === 'enabled'}
         <p class="err">
-          <strong>Messages in iCloud is enabled.</strong> Bubble Wrap edits this Mac's Messages
-          database directly, which Messages in iCloud doesn't track: the delete may not reach your
-          other devices, and deleted messages may be downloaded to this Mac again. For predictable
-          results, turn it off in
-          <strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong> first.
+          <strong>Messages in iCloud is enabled.</strong> The Messages database records every
+          deletion for iCloud sync, so when Messages next syncs, these messages and attachments are
+          expected to be deleted from iCloud and from your other devices too — not just this Mac. If
+          you only want to free up space here, this isn't the right tool while Messages in iCloud is
+          on (<strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong>).
         </p>
         <label class="checkbox">
           <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
-          I understand deleted messages may come back from iCloud and want to proceed anyway.
+          I understand this will likely delete them from iCloud and all my devices.
         </label>
       {:else if safety?.icloudMessages === 'unknown'}
         <p class="meta">
-          Couldn't confirm Messages-in-iCloud state. If it's enabled, deleted messages may be
-          downloaded to this Mac again, and the delete may not reach your other devices.
+          Couldn't confirm Messages-in-iCloud state. If it's enabled, deletions are recorded for
+          iCloud sync and are expected to remove these messages from iCloud and your other devices
+          too.
         </p>
         <label class="checkbox">
           <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
@@ -1164,9 +1166,20 @@
           Delete messages
         </label>
         <label class="checkbox">
-          <input type="checkbox" bind:checked={deleteAttachments} disabled={deleting} />
+          <input
+            type="checkbox"
+            bind:checked={deleteAttachments}
+            disabled={deleting || deleteMessages}
+          />
           Delete attachment files
         </label>
+        {#if deleteMessages}
+          <p class="meta">
+            Deleting messages always deletes their attachments too — the Messages database does
+            this itself. To keep conversations and only free up attachment space, untick “Delete
+            messages”.
+          </p>
+        {/if}
       </div>
 
       {#if dateFilterError}
@@ -1180,12 +1193,6 @@
             <strong>{deletePreview.attachmentCount.toLocaleString()}</strong> attachments
             ({formatBytes(deletePreview.attachmentBytes)} on disk across
             {deletePreview.onDiskFileCount.toLocaleString()} files).
-          </p>
-          {@render reactionNote()}
-        {:else if deleteMessages}
-          <p>
-            Will delete <strong>{deletePreview.messageCount.toLocaleString()}</strong> messages.
-            Attachment records and files will be left on disk.
           </p>
           {@render reactionNote()}
         {:else if deleteAttachments}

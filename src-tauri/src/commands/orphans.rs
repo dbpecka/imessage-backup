@@ -272,6 +272,33 @@ fn scan_orphans_blocking(
     })
 }
 
+/// Delete the given orphan rows in one transaction, re-checking the orphan
+/// condition so a row that gained a link since the scan is left alone.
+/// Returns the rowids whose record is actually gone.
+fn delete_orphan_rows(conn: &mut Connection, rows: &[DbOrphan]) -> Result<HashSet<i64>, AppError> {
+    let mut deleted = HashSet::new();
+    let tx = conn.transaction()?;
+    for o in rows {
+        tx.execute(
+            "DELETE FROM attachment WHERE ROWID = ?1 \
+             AND NOT EXISTS (SELECT 1 FROM message_attachment_join WHERE attachment_id = ?1)",
+            rusqlite::params![o.rowid],
+        )?;
+        // Check directly rather than trusting the affected-row count:
+        // chat.db's delete triggers can make it unreliable.
+        let still_there: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM attachment WHERE ROWID = ?1)",
+            rusqlite::params![o.rowid],
+            |r| r.get(0),
+        )?;
+        if !still_there {
+            deleted.insert(o.rowid);
+        }
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 fn ensure_messages_not_running() -> Result<(), AppError> {
     if is_messages_running().unwrap_or(true) {
         return Err(AppError::Other(
@@ -335,36 +362,40 @@ fn clean_orphans_blocking(
 
     let mut db_rows_deleted = 0u64;
     let mut snapshot_path = None;
+    // Rowids whose record really was deleted. Only their files are removed:
+    // a row the re-check below kept (it gained a link since the scan) must
+    // keep its file too.
+    let mut deleted: HashSet<i64> = HashSet::new();
     if !orphans.db.is_empty() {
         checkpoint_wal(&db_path)?;
         let snapshot = snapshot_chat_db(&db_path, snapshot_root)?;
-        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP);
+        prune_snapshots(snapshot_root, SNAPSHOTS_TO_KEEP, &snapshot.dir);
         snapshot_path = Some(snapshot.dir.display().to_string());
 
         ensure_messages_not_running()?;
         let mut conn = open_write(&db_path)?;
-        let tx = conn.transaction()?;
-        for o in &orphans.db {
-            // Re-check the orphan condition inside the transaction so a row
-            // that gained a link since the scan is left alone.
-            if tx.execute(
-                "DELETE FROM attachment WHERE ROWID = ?1 \
-                 AND NOT EXISTS (SELECT 1 FROM message_attachment_join WHERE attachment_id = ?1)",
-                rusqlite::params![o.rowid],
-            )? > 0
-            {
-                db_rows_deleted += 1;
-            }
-        }
-        tx.commit()?;
-        // The included kept attachments are gone now; stop tracking them.
-        store.remove(&orphans.included_retained)?;
+        deleted = delete_orphan_rows(&mut conn, &orphans.db)?;
+        db_rows_deleted = deleted.len() as u64;
+        // The included kept attachments that are gone now; stop tracking
+        // them.
+        let gone: Vec<i64> = orphans
+            .included_retained
+            .iter()
+            .copied()
+            .filter(|id| deleted.contains(id))
+            .collect();
+        store.remove(&gone)?;
     }
 
     let mut files_skipped = 0u64;
     let mut db_files_removed = 0u64;
     let mut db_files_failed = 0u64;
-    for path in orphans.db.iter().filter_map(|o| o.path.as_deref()) {
+    let deleted_files = orphans
+        .db
+        .iter()
+        .filter(|o| deleted.contains(&o.rowid))
+        .filter_map(|o| o.path.as_deref());
+    for path in deleted_files {
         match remove_attachment_file(path, &roots, "orphan-clean") {
             RemoveOutcome::Removed => db_files_removed += 1,
             RemoveOutcome::Missing => {}
@@ -517,6 +548,31 @@ mod tests {
             .db
             .iter()
             .any(|d| d.rowid == 3 && d.path == Some(own.clone())));
+    }
+
+    #[test]
+    fn rows_linked_since_the_scan_are_not_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let (mut conn, root) = fixture(&tmp);
+        let a = file(&root.join("ab/01/G/a.jpg"));
+        let b = file(&root.join("ab/02/G/b.jpg"));
+        add_row(&conn, 1, &a, false);
+        add_row(&conn, 2, &b, false);
+        let o = find_orphans(
+            &conn,
+            &BTreeSet::new(),
+            false,
+            std::slice::from_ref(&root),
+            later(),
+        )
+        .unwrap();
+        assert_eq!(o.db.len(), 2);
+
+        // Row 2 gets linked to a message after the scan.
+        conn.execute("INSERT INTO message_attachment_join VALUES (5, 2)", [])
+            .unwrap();
+        let deleted = delete_orphan_rows(&mut conn, &o.db).unwrap();
+        assert_eq!(deleted, HashSet::from([1]));
     }
 
     #[test]

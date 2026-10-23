@@ -54,7 +54,7 @@ The single-page UI walks through five numbered cards in sequence:
 
 4. **Backup** — format selector (JSON / HTML / PDF / TXT), folder picker (home folder or an external drive), attachments toggle. Each run writes into a new `Bubble Wrap <timestamp>` subfolder; copied attachments are named `<rowid>-<original name>` so same-named files (e.g. every `Audio Message.caf`) never collide. Progress is driven by real-time events from the Rust side. Result shows message count, conversation count, per-attachment copy outcomes (copied / not on this Mac / failed), and the output path.
 
-5. **Delete** (opt-in, behind a toggle) — shows Messages.app running status and iCloud sync warning. Scope selector: delete messages + attachments, messages only, or attachments only. Requires typed confirmation before executing.
+5. **Delete** (opt-in, behind a toggle) — shows Messages.app running status and a Messages in iCloud warning (chat.db's own triggers queue every deletion for iCloud sync, so with Messages in iCloud on, deletes are expected to reach your other devices). Scope: delete messages together with their attachments, or attachments only — deleting messages while keeping their attachments isn't offered, because chat.db's triggers delete an attachment's record along with its last message. Requires typed confirmation before executing.
 
 A **File > Clean Orphaned Data…** menu item opens a modal that scans for and removes two categories of orphaned data: attachment DB rows with no linked message, and files in `~/Library/Messages/Attachments` and `StickerCache` with no DB record.
 

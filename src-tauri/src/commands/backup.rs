@@ -11,6 +11,8 @@ use imessage_database::{
     },
     tables::messages::message::Message,
 };
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -22,9 +24,44 @@ use crate::core::db_path::{blocking, check_chat_db_access, default_chat_db_path,
 use crate::core::filter::FilterSpec;
 use crate::core::op_lock::OperationLock;
 use crate::core::progress::TauriProgress;
-use crate::core::receipts::BackupReceipts;
+use crate::core::receipts::{BackupReceipts, ContentFingerprint};
 use crate::core::snapshot::create_unique_dir;
 use crate::error::AppError;
+
+/// Write the tapbacks in `ids` to `tapbacks-outside-filter.json`.
+fn write_extra_tapbacks(
+    conn: &rusqlite::Connection,
+    export_path: &std::path::Path,
+    ids: &[i64],
+) -> Result<(), AppError> {
+    let mut rows = Vec::new();
+    for chunk in ids.chunks(800) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT ROWID, guid, associated_message_guid, associated_message_type, date, \
+                    handle_id, is_from_me, text \
+             FROM message WHERE ROWID IN ({placeholders})"
+        ))?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            Ok(serde_json::json!({
+                "rowid": r.get::<_, i64>(0)?,
+                "guid": r.get::<_, Option<String>>(1)?,
+                "associatedMessageGuid": r.get::<_, Option<String>>(2)?,
+                "associatedMessageType": r.get::<_, Option<i64>>(3)?,
+                "date": r.get::<_, Option<i64>>(4)?,
+                "handleId": r.get::<_, Option<i64>>(5)?,
+                "isFromMe": r.get::<_, Option<i64>>(6)?,
+                "text": r.get::<_, Option<String>>(7)?,
+            }))
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    let json = serde_json::to_vec_pretty(&rows).map_err(|e| AppError::Other(e.to_string()))?;
+    std::fs::write(export_path.join("tapbacks-outside-filter.json"), json)?;
+    Ok(())
+}
 
 fn count(r: Result<i64, imessage_database::error::table::TableError>) -> Result<u64, AppError> {
     r.map(|n| n.max(0) as u64)
@@ -87,13 +124,14 @@ pub async fn run_backup(
     let progress = TauriProgress::new(app.clone(), BACKUP_PROGRESS_EVENT);
     let format_label = format.to_string();
 
-    let (result, content) = blocking(move || -> Result<_, AppError> {
+    let (result, content, copied) = blocking(move || -> Result<_, AppError> {
         // Fingerprint what the filter matches *before* exporting. Anything
         // that arrives during or after the run changes the fingerprint, so
         // this backup can never vouch for messages it might not contain.
-        let content = {
+        let (content, planned_attachments, reaction_ids) = {
             let conn = open_read(&db_path)?;
-            filter_content(&conn, &query, &db_path)?.1
+            let fc = filter_content(&conn, &query, &db_path)?;
+            (fc.content, fc.plan.attachment_rowids, fc.reaction_ids)
         };
 
         // Every run gets its own folder: the JSON exporter appends to
@@ -219,6 +257,31 @@ pub async fn run_backup(
                 }
             };
 
+        // A delete of these messages also removes tapbacks on them that
+        // fall outside the filter (so the export doesn't contain them).
+        // Save those alongside, so the backup really holds everything the
+        // delete would remove.
+        if !reaction_ids.is_empty() {
+            let conn = open_read(&db_path)?;
+            write_extra_tapbacks(&conn, &export_path, &reaction_ids)?;
+        }
+
+        // Only attachments the delete plan would touch count, so the
+        // fingerprint lines up with the one computed at delete time (the
+        // export can also include e.g. "Recently Deleted" messages).
+        let planned: HashSet<i64> = planned_attachments.into_iter().collect();
+        let copied_ids: Vec<i64> = copy_summary
+            .as_ref()
+            .map(|c| {
+                c.copied_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| planned.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let copied = ContentFingerprint::of(&[], &copied_ids);
+
         let result = BackupResult {
             message_count,
             attachment_count,
@@ -230,7 +293,7 @@ pub async fn run_backup(
             includes_attachments: copy_summary.as_ref().is_some_and(|c| c.failed == 0),
             attachment_copy: copy_summary,
         };
-        Ok((result, content))
+        Ok((result, content, copied))
     })
     .await?;
 
@@ -240,6 +303,7 @@ pub async fn run_backup(
     receipts.record(
         filter_key,
         content,
+        copied,
         result.includes_attachments,
         std::path::Path::new(&result.export_path),
     );

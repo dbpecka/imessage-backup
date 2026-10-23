@@ -44,6 +44,9 @@ pub struct CopySummary {
     pub failed: u64,
     /// The first few failures, as "path: reason".
     pub failures: Vec<String>,
+    /// Rowids of the attachments actually copied, for the backup receipt.
+    #[serde(skip)]
+    pub copied_ids: Vec<i64>,
 }
 
 impl CopySummary {
@@ -209,6 +212,7 @@ pub fn copy_attachments(
                 }
                 summary.copied += 1;
                 summary.bytes += n;
+                summary.copied_ids.push(i64::from(attachment.rowid));
                 copied.insert(attachment.rowid, rel);
             }
             Ok(n) => {
@@ -283,16 +287,45 @@ pub fn verify_runtime_copies(
             summary.unresolvable += 1;
             return;
         };
-        if let Some(bytes) = by_stem.get(&attachment.rowid.to_string()) {
-            summary.copied += 1;
-            summary.bytes += bytes;
-        } else if !src.exists() {
+        let Some(expected) = source_size(&src) else {
             summary.not_on_mac += 1;
-        } else {
-            summary.fail(&src, "not found in the export");
+            return;
+        };
+        match by_stem.get(&attachment.rowid.to_string()) {
+            // The runtime copies byte-for-byte (`Clone` mode), so a size
+            // difference means a copy that failed partway; the library only
+            // logs those and leaves the partial file behind.
+            Some(&bytes) if bytes == expected => {
+                summary.copied += 1;
+                summary.bytes += bytes;
+                summary.copied_ids.push(i64::from(attachment.rowid));
+            }
+            Some(&bytes) => summary.fail(
+                &src,
+                format!("incomplete copy ({bytes} of {expected} bytes)"),
+            ),
+            None => summary.fail(&src, "not found in the export"),
         }
     })?;
     Ok(summary)
+}
+
+/// Size of an attachment source: a file's length, or the total of a
+/// folder's files. `None` if it isn't on this Mac.
+fn source_size(src: &Path) -> Option<u64> {
+    let meta = fs::metadata(src).ok()?;
+    if meta.is_dir() {
+        let mut files = Vec::new();
+        walk_files(src, &mut files);
+        Some(
+            files
+                .iter()
+                .map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+                .sum(),
+        )
+    } else {
+        Some(meta.len())
+    }
 }
 
 /// The JSON export runs in reference mode (so the library doesn't do its
@@ -437,6 +470,20 @@ mod tests {
         let stems = runtime_copy_sizes(tmp.path());
         assert_eq!(stems.get("11"), Some(&2));
         assert_eq!(stems.get("12"), Some(&4));
+    }
+
+    #[test]
+    fn source_size_sums_folder_contents() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("a.jpg");
+        fs::write(&f, b"abc").unwrap();
+        let d = tmp.path().join("bundle");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("x"), b"12").unwrap();
+        fs::write(d.join("sub/y"), b"345").unwrap();
+        assert_eq!(source_size(&f), Some(3));
+        assert_eq!(source_size(&d), Some(5));
+        assert_eq!(source_size(&tmp.path().join("missing")), None);
     }
 
     #[test]

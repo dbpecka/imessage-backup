@@ -81,6 +81,20 @@ impl FilterSpec {
     }
 
     pub fn to_query_context(&self) -> Result<QueryContext, AppError> {
+        // The library marks a handle filter as active but its SQL ignores
+        // it, so a contact-only filter would quietly match every message —
+        // and a delete would target the whole database. Refuse filters
+        // that aren't actually applied rather than widen the scope.
+        if self.handle_ids.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(AppError::Other(
+                "Filtering by contact isn't supported yet; filter by conversation instead.".into(),
+            ));
+        }
+        if self.attachments.is_some() {
+            return Err(AppError::Other(
+                "Filtering by attachment type or size isn't supported yet.".into(),
+            ));
+        }
         let mut ctx = QueryContext::default();
 
         if let Some(range) = &self.date_range {
@@ -96,11 +110,6 @@ impl FilterSpec {
         if let Some(ids) = &self.chat_ids {
             let set: BTreeSet<i32> = ids.iter().copied().collect();
             ctx.set_selected_chat_ids(set);
-        }
-
-        if let Some(ids) = &self.handle_ids {
-            let set: BTreeSet<i32> = ids.iter().copied().collect();
-            ctx.set_selected_handle_ids(set);
         }
 
         Ok(ctx)
@@ -161,6 +170,20 @@ mod tests {
         let end = ctx_for(None, Some("2020-12-31")).end.unwrap();
         let next_start = ctx_for(Some("2021-01-01"), None).start.unwrap();
         assert_eq!(end, next_start - 1);
+    }
+
+    #[test]
+    fn unapplied_filters_are_rejected_not_ignored() {
+        let by_contact = FilterSpec {
+            handle_ids: Some(vec![3]),
+            ..Default::default()
+        };
+        assert!(by_contact.to_query_context().is_err());
+        let empty_contacts = FilterSpec {
+            handle_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!empty_contacts.to_query_context().unwrap().has_filters());
     }
 
     #[test]
