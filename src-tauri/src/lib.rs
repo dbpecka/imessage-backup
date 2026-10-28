@@ -2,6 +2,9 @@ mod commands;
 mod core;
 mod error;
 
+#[cfg(test)]
+mod e2e_tests;
+
 pub use error::AppError;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -11,8 +14,17 @@ use tauri::Emitter;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
+        .manage(core::op_lock::OperationLock::default())
         .setup(|app| {
+            use tauri::Manager;
+            let receipts = match app.path().app_data_dir() {
+                Ok(dir) => {
+                    core::receipts::BackupReceipts::persistent(dir.join("backup_receipts.json"))
+                }
+                Err(_) => core::receipts::BackupReceipts::default(),
+            };
+            app.manage(std::sync::Arc::new(receipts));
+
             let clean_item =
                 MenuItemBuilder::with_id("clean-orphans", "Clean Orphaned Data…").build(app)?;
 
@@ -68,9 +80,12 @@ pub fn run() {
             commands::backup::run_backup,
             commands::delete::preview_delete,
             commands::delete::run_delete,
+            commands::delete::backup_coverage,
             commands::safety::safety_status,
             commands::orphans::scan_orphans,
             commands::orphans::clean_orphans,
+            commands::restore::list_snapshots,
+            commands::restore::restore_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

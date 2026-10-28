@@ -15,6 +15,9 @@
     type SafetyStatus,
     type DeletePreview,
     type DeleteResult,
+    type BackupCoverage,
+    type SnapshotInfo,
+    type RestoreResult,
     type DeleteScope,
     type OrphanScan,
     type OrphanCleanResult,
@@ -69,12 +72,14 @@
 
     if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
       const [y, m, d] = trimmed.split('-').map(Number);
-      const date = new Date(trimmed + 'T00:00:00');
+      // Build and check in the same (local) calendar: mixing local
+      // construction with UTC getters rejects every date east of UTC.
+      const date = new Date(y, m - 1, d);
       if (
         isNaN(date.getTime()) ||
-        date.getUTCFullYear() !== y ||
-        date.getUTCMonth() + 1 !== m ||
-        date.getUTCDate() !== d
+        date.getFullYear() !== y ||
+        date.getMonth() + 1 !== m ||
+        date.getDate() !== d
       ) {
         return { resolved: '', error: 'Invalid date' };
       }
@@ -96,6 +101,13 @@
       : ''
   );
 
+  // Any date problem blocks preview, backup and delete outright. Never fall
+  // back to "no date filter": that silently widens the scope to every
+  // message in the database.
+  let dateFilterError = $derived(
+    startDateParsed.error || endDateParsed.error || endDateOrderError
+  );
+
   // preview state
   let preview = $state<BackupPreview | null>(null);
   let previewing = $state(false);
@@ -107,6 +119,20 @@
   let format = $state<ExportFormat>('json');
   let destination = $state<string>('');
   let copyAttachments = $state(true);
+  // Encrypted backups: an AES-256 disk image opened with this password.
+  let encryptBackup = $state(false);
+  let backupPassword = $state('');
+  let backupPasswordConfirm = $state('');
+  const MIN_PASSWORD_LEN = 8;
+  const passwordProblem = $derived(
+    !encryptBackup
+      ? ''
+      : backupPassword.length < MIN_PASSWORD_LEN
+        ? `Use at least ${MIN_PASSWORD_LEN} characters.`
+        : backupPassword !== backupPasswordConfirm
+          ? "The passwords don't match."
+          : ''
+  );
   let running = $state(false);
   let runError = $state<string>('');
   let runResult = $state<BackupResult | null>(null);
@@ -119,6 +145,13 @@
   let orphanScan = $state<OrphanScan | null>(null);
   let orphanResult = $state<OrphanCleanResult | null>(null);
   let orphanError = $state('');
+  // Whether the current scan includes attachments kept by earlier
+  // messages-only deletes.
+  let orphanIncludeRetained = $state(false);
+  // Messages in iCloud state for the cleanup dialog: removing attachment
+  // records queues them for iCloud deletion too.
+  let orphanIcloud = $state<'enabled' | 'disabled' | 'unknown'>('unknown');
+  let orphanIcloudAck = $state(false);
   let unlistenMenuClean: UnlistenFn | null = null;
   let orphanModalCard = $state<HTMLDivElement | null>(null);
 
@@ -177,6 +210,13 @@
   let deletePreview = $state<DeletePreview | null>(null);
   let deletePreviewing = $state(false);
   let deletePreviewSeq = 0;
+  // Filter the current `deletePreview` was computed for. A preview only
+  // counts as current when this matches the live filter.
+  let deletePreviewFilterKey = $state('');
+  // Backend's view of whether a backup (from this or an earlier session)
+  // covers exactly what the filter matches now. Fetched with the preview so
+  // both describe the same filter.
+  let coverage = $state<BackupCoverage | null>(null);
   let deletePreviewTimer: ReturnType<typeof setTimeout> | undefined;
   let deleteMessages = $state(true);
   let deleteAttachments = $state(true);
@@ -184,7 +224,10 @@
   let deleteResult = $state<DeleteResult | null>(null);
   let deleteError = $state('');
   let icloudAcknowledged = $state(false);
+  let notOnMacAcknowledged = $state(false);
   let skipBackupAcknowledged = $state(false);
+  // What the user typed to confirm. The backend requires exactly "DELETE".
+  let typedConfirmation = $state('');
 
   let unlistenFocus: UnlistenFn | null = null;
 
@@ -206,7 +249,7 @@
     }).then((fn) => {
       unlistenProgress = fn;
     });
-    listen('menu:clean-orphans', startOrphanScan).then((fn) => {
+    listen('menu:clean-orphans', () => startOrphanScan(false)).then((fn) => {
       unlistenMenuClean = fn;
     });
   });
@@ -308,10 +351,14 @@
     }
   }
 
-  function toggleChat(rowid: number) {
+  function isChatSelected(chat: ChatSummary) {
+    return chat.chatIds.some((id) => selectedChatIds.has(id));
+  }
+
+  function toggleChat(chat: ChatSummary) {
     const next = new Set(selectedChatIds);
-    if (next.has(rowid)) next.delete(rowid);
-    else next.add(rowid);
+    if (isChatSelected(chat)) for (const id of chat.chatIds) next.delete(id);
+    else next.add(chat.rowid);
     selectedChatIds = next;
   }
 
@@ -327,7 +374,15 @@
       filter.dateRange = { start: start || undefined, end: end || undefined };
     }
     if (selectedChatIds.size > 0) {
-      filter.chatIds = [...selectedChatIds];
+      // A listed conversation can span several chat rows (iMessage + SMS…);
+      // include all of them so nothing is left behind.
+      // Look up by any member id, since the primary row can change when the
+      // list is reloaded.
+      const byMember = new Map<number, number[]>();
+      for (const c of chats ?? []) for (const cid of c.chatIds) byMember.set(cid, c.chatIds);
+      const ids = new Set<number>();
+      for (const id of selectedChatIds) for (const cid of byMember.get(id) ?? [id]) ids.add(cid);
+      filter.chatIds = [...ids].sort((a, b) => a - b);
     }
     return filter;
   }
@@ -360,7 +415,7 @@
     void selectedChatIds;
 
     if (status !== 'ok') return;
-    if (startDateParsed.error || endDateParsed.error || endDateOrderError) return;
+    if (dateFilterError) return;
 
     clearTimeout(previewTimer);
     previewTimer = setTimeout(runPreview, 400);
@@ -379,6 +434,34 @@
     void selectedChatIds;
     runResult = null;
     skipBackupAcknowledged = false;
+    // The "not on this Mac" acknowledgement was for a specific set of
+    // attachments; a different filter needs a fresh decision.
+    notOnMacAcknowledged = false;
+    typedConfirmation = '';
+  });
+
+  // Likewise the iCloud acknowledgement is for the state the user saw. A
+  // derived only notifies when its value changes, so re-probing the same
+  // state (as runDelete does) doesn't clear it.
+  const icloudState = $derived(safety?.icloudMessages ?? null);
+  $effect(() => {
+    void icloudState;
+    icloudAcknowledged = false;
+  });
+
+  // Backups are plain, unencrypted copies of every message and attachment.
+  // Point it out more strongly where the folder is likely to leave the Mac
+  // or be readable by others.
+  const destinationRisk = $derived.by(() => {
+    const d = destination;
+    if (!d) return '';
+    if (d.startsWith('/Volumes/'))
+      return 'This is an external drive. Anyone with the drive can read the backup — many drive formats have no file permissions.';
+    if (d.includes('/Library/Mobile Documents/'))
+      return 'This folder is in iCloud Drive, so the backup will be uploaded to iCloud and may be removed from this Mac to save space.';
+    if (/\/Users\/[^/]+\/(Desktop|Documents)(\/|$)/.test(d))
+      return 'If "Desktop & Documents" syncing is on in iCloud settings, this backup will be uploaded to iCloud Drive and may be removed from this Mac to save space.';
+    return '';
   });
 
   async function pickDestination() {
@@ -398,19 +481,35 @@
       runError = 'Pick a destination folder first.';
       return;
     }
+    if (dateFilterError) {
+      runError = `Fix the date filter first: ${dateFilterError}.`;
+      return;
+    }
+    if (passwordProblem) {
+      runError = passwordProblem;
+      return;
+    }
     running = true;
     try {
       runResult = await api.runBackup({
         filter: buildFilter(),
         format,
         destination,
-        copyAttachments
+        copyAttachments,
+        encryptPassword: encryptBackup ? backupPassword : undefined
       });
     } catch (err) {
       runError = appErrorMessage(err);
     } finally {
       running = false;
+      // Don't keep the password around in the page longer than needed.
+      backupPassword = '';
+      backupPasswordConfirm = '';
     }
+    // A new backup supersedes any earlier "delete without a backup" choice.
+    if (runResult) skipBackupAcknowledged = false;
+    // Refresh what the delete step knows about backups.
+    if (deleteExpanded && status === 'ok' && !dateFilterError) await runDeletePreview();
   }
 
   let checkingSafety = $state(false);
@@ -429,6 +528,62 @@
     }
   }
 
+  // Snapshots that can be restored (undo a delete or cleanup).
+  let snapshots = $state<SnapshotInfo[] | null>(null);
+  let restoring = $state(false);
+  let restoreError = $state('');
+  let restoreResult = $state<RestoreResult | null>(null);
+
+  async function loadSnapshots() {
+    try {
+      snapshots = await api.listSnapshots();
+    } catch (err) {
+      restoreError = appErrorMessage(err);
+    }
+  }
+
+  const snapshotKindLabel: Record<SnapshotInfo['kind'], string> = {
+    delete: 'Before a delete',
+    orphanClean: 'Before an orphan cleanup',
+    preRestore: 'Before a restore'
+  };
+
+  async function restoreSnapshot(snap: SnapshotInfo) {
+    restoreError = '';
+    restoreResult = null;
+    const ok = await refreshSafety();
+    if (!ok) return;
+    if (safety?.messagesRunning) {
+      restoreError = 'Quit the Messages app before restoring.';
+      return;
+    }
+    const when = new Date(snap.takenAtUnix * 1000).toLocaleString();
+    const icloudOn = safety?.icloudMessages !== 'disabled';
+    const confirmed = await confirm(
+      `Restore the Messages database to how it was on ${when}?\n\n` +
+        'Messages received on this Mac since then will be removed from it. Attachment files ' +
+        "deleted since then aren't in the snapshot and stay deleted (restore them from your " +
+        'backup). The current database is saved first, so you can undo this.' +
+        (icloudOn
+          ? '\n\nMessages in iCloud may be on: how iCloud reconciles a database rolled back ' +
+            'underneath it is unpredictable.'
+          : ''),
+      { title: 'Restore Snapshot', kind: 'warning' }
+    );
+    if (!confirmed) return;
+    restoring = true;
+    try {
+      // The dialog above named the iCloud risk when it applied, so OK is
+      // the user's explicit acknowledgement of it.
+      restoreResult = await api.restoreSnapshot(snap.path, icloudOn);
+      await Promise.all([loadSnapshots(), runPreview(), runDeletePreview(), loadChats()]);
+    } catch (err) {
+      restoreError = appErrorMessage(err);
+    } finally {
+      restoring = false;
+    }
+  }
+
   async function expandDelete() {
     deleteError = '';
     const ok = await refreshSafety();
@@ -438,19 +593,30 @@
       return;
     }
     deleteExpanded = true;
+    void loadSnapshots();
   }
 
   async function runDeletePreview() {
     const seq = ++deletePreviewSeq;
     deletePreviewing = true;
     deleteError = '';
+    const filter = buildFilter();
     try {
-      const result = await api.previewDelete(buildFilter());
-      if (seq === deletePreviewSeq) deletePreview = result;
+      const [result, cov] = await Promise.all([
+        api.previewDelete(filter),
+        api.backupCoverage(filter)
+      ]);
+      if (seq === deletePreviewSeq) {
+        deletePreview = result;
+        coverage = cov;
+        deletePreviewFilterKey = JSON.stringify(filter);
+      }
     } catch (err) {
       if (seq === deletePreviewSeq) {
         deleteError = appErrorMessage(err);
         deletePreview = null;
+        coverage = null;
+        deletePreviewFilterKey = '';
       }
     } finally {
       if (seq === deletePreviewSeq) deletePreviewing = false;
@@ -463,8 +629,19 @@
     void endDate;
     void selectedChatIds;
     void deleteExpanded;
+    // The chat list feeds buildFilter() (a conversation can span several
+    // chat rows), so a reload can change the filter too.
+    void chats;
 
     if (status !== 'ok' || !deleteExpanded) return;
+    if (dateFilterError) {
+      // Don't show (or keep) counts for a filter we can't apply.
+      clearTimeout(deletePreviewTimer);
+      deletePreview = null;
+      coverage = null;
+      deletePreviewFilterKey = '';
+      return;
+    }
 
     clearTimeout(deletePreviewTimer);
     deletePreviewTimer = setTimeout(runDeletePreview, 400);
@@ -472,7 +649,10 @@
   });
 
   async function runDelete() {
-    if (!deletePreview) return;
+    if (!deletePreview || !deletePreviewCurrent || dateFilterError) return;
+    const filter = buildFilter();
+    const expectedMessageCount = deleteMessages ? deletePreview.messageCount : 0;
+    const expectedAttachmentCount = deleteAttachments ? deletePreview.attachmentCount : 0;
 
     const parts: string[] = [];
     if (deleteMessages && deletePreview.messageCount > 0)
@@ -485,7 +665,7 @@
       );
 
     const ok = await confirm(
-      `Permanently delete ${parts.join(' and ')} from chat.db? This cannot be undone.`,
+      `Permanently delete ${parts.join(' and ')} from ${deleteScopeDescription}? This cannot be undone.`,
       { title: 'Confirm Delete', kind: 'warning' }
     );
     if (!ok) return;
@@ -496,9 +676,15 @@
     try {
       // Final safety probe: Messages.app could have reopened between the
       // preview and the click.
+      const icloudBefore = safety?.icloudMessages;
       const safetyOk = await refreshSafety();
       if (!safetyOk) {
         // refreshSafety already populated deleteError.
+        return;
+      }
+      if (safety?.icloudMessages !== icloudBefore) {
+        deleteError =
+          'The Messages in iCloud status changed. Review the updated warning above before retrying.';
         return;
       }
       if (safety?.messagesRunning) {
@@ -507,38 +693,83 @@
         return;
       }
       deleteResult = await api.runDelete({
-        filter: buildFilter(),
-        confirmationPhrase: 'DELETE',
-        backupVerified: runResult !== null,
-        acknowledgeSkipBackup: runResult !== null || skipBackupAcknowledged,
+        filter,
+        // The backend refuses if what it would delete differs from what the
+        // dialog above showed.
+        expectedMessageCount,
+        expectedAttachmentCount,
+        confirmationPhrase: typedConfirmation.trim(),
+        // The backend checks its own record of completed backups; only the
+        // explicit opt-out is ours to send — and only while it's on screen.
+        // A tick left over from before a backup ran must not count if that
+        // backup has since stopped covering the delete (e.g. its drive was
+        // ejected).
+        acknowledgeSkipBackup: skipBackupAcknowledged && !backupCoversDelete,
         deleteScope,
-        // Surface the iCloud risk to the backend so it can refuse if detection
-        // flipped to Enabled since the user ticked the acknowledgement box.
-        acknowledgeIcloudSync: safety?.icloudMessages !== 'enabled' || icloudAcknowledged
+        // Only the user's own acknowledgement — never auto-ack, or the
+        // backend gate is bypassed if its detection disagrees with ours.
+        acknowledgeIcloudSync: icloudAcknowledged,
+        acknowledgeNotOnMac: notOnMacAcknowledged
       });
-      await Promise.all([runPreview(), runDeletePreview(), loadChats()]);
+      // One-off decisions: the next delete needs its own.
+      skipBackupAcknowledged = false;
+      notOnMacAcknowledged = false;
+      typedConfirmation = '';
+      await Promise.all([runPreview(), runDeletePreview(), loadChats(), loadSnapshots()]);
     } catch (err) {
       deleteError = appErrorMessage(err);
+      // The backend refuses when what it would delete no longer matches the
+      // preview or the backup (e.g. a message just arrived). Refresh both so
+      // the user sees the current state instead of retrying stale counts.
+      void runDeletePreview().then(() => {
+        if (!deleteError) deleteError = appErrorMessage(err);
+      });
     } finally {
       deleting = false;
     }
   }
 
-  const deleteScope = $derived<DeleteScope>(
-    deleteMessages && deleteAttachments
-      ? 'both'
-      : deleteMessages
-        ? 'messages_only'
-        : 'attachments_only'
+  // Deleting a message always deletes its attachments: chat.db's own
+  // triggers remove an attachment's record when its last message goes, so
+  // "keep the attachments" would only leave untracked files behind.
+  $effect(() => {
+    if (deleteMessages) deleteAttachments = true;
+  });
+
+  const deleteScope = $derived<DeleteScope>(deleteMessages ? 'both' : 'attachments_only');
+
+  // Conversations the current filter selects, by name. Chats hidden by the
+  // search box stay selected, so the delete step must say which ones count.
+  const selectedChatNames = $derived(
+    (chats ?? []).filter((c) => isChatSelected(c)).map((c) => displayName(c))
   );
 
-  async function startOrphanScan() {
+  const deleteScopeDescription = $derived.by(() => {
+    const convs =
+      selectedChatNames.length === 0
+        ? 'all conversations'
+        : selectedChatNames.length <= 3
+          ? selectedChatNames.join(', ')
+          : `${selectedChatNames.slice(0, 3).join(', ')} and ${selectedChatNames.length - 3} more conversations`;
+    const s = startDateParsed.resolved;
+    const e = endDateParsed.resolved;
+    const dates = s && e ? ` (${s} to ${e})` : s ? ` (from ${s})` : e ? ` (until ${e})` : '';
+    return convs + dates;
+  });
+
+  async function startOrphanScan(includeRetained = false) {
+    orphanIncludeRetained = includeRetained;
     orphanModal = 'scanning';
     orphanScan = null;
     orphanResult = null;
     orphanError = '';
+    orphanIcloudAck = false;
     try {
-      orphanScan = await api.scanOrphans();
+      orphanIcloud = await api
+        .safetyStatus()
+        .then((s) => s.icloudMessages)
+        .catch(() => 'unknown' as const);
+      orphanScan = await api.scanOrphans(includeRetained);
       orphanModal = 'preview';
     } catch (err) {
       orphanError = appErrorMessage(err);
@@ -547,16 +778,25 @@
   }
 
   async function runOrphanClean() {
+    if (!orphanScan) return;
     orphanModal = 'cleaning';
     orphanError = '';
     try {
-      orphanResult = await api.cleanOrphans();
+      orphanResult = await api.cleanOrphans(
+        orphanScan.fingerprint,
+        orphanIncludeRetained,
+        orphanIcloudAck
+      );
       orphanModal = 'done';
     } catch (err) {
       orphanError = appErrorMessage(err);
       orphanModal = 'error';
     }
   }
+
+  const orphanNeedsIcloudAck = $derived(
+    (orphanScan?.dbOrphanCount ?? 0) > 0 && orphanIcloud !== 'disabled'
+  );
 
   const totalOrphanItems = $derived(
     (orphanScan?.dbOrphanCount ?? 0) + (orphanScan?.fsOrphanCount ?? 0)
@@ -565,15 +805,37 @@
     (orphanScan?.dbOrphanBytes ?? 0) + (orphanScan?.fsOrphanBytes ?? 0)
   );
 
+  // A backup only protects attachment files if it copied them: the safety
+  // snapshot taken before a delete covers chat.db, not files on disk.
+  const backupCoversDelete = $derived(
+    coverage !== null &&
+      coverage.covered &&
+      (!deleteAttachments || coverage.withAttachments)
+  );
+
+  // Attachment records whose files only exist in iCloud: no backup can
+  // include them, and deleting the records makes them unrecoverable.
+  const deletesNotOnMac = $derived(deleteAttachments && (deletePreview?.notOnMacCount ?? 0) > 0);
+
+  const deletePreviewCurrent = $derived(
+    deletePreview !== null &&
+      !deletePreviewing &&
+      deletePreviewFilterKey === JSON.stringify(buildFilter())
+  );
+
   const deleteReady = $derived(
     deletePreview !== null &&
+      deletePreviewCurrent &&
+      !dateFilterError &&
       (deleteMessages || deleteAttachments) &&
       ((deleteMessages && deletePreview.messageCount > 0) ||
         (deleteAttachments && deletePreview.attachmentCount > 0)) &&
       safety !== null &&
       !safety.messagesRunning &&
-      (safety.icloudMessages !== 'enabled' || icloudAcknowledged) &&
-      (runResult !== null || skipBackupAcknowledged) &&
+      (safety.icloudMessages === 'disabled' || icloudAcknowledged) &&
+      (backupCoversDelete || skipBackupAcknowledged) &&
+      typedConfirmation.trim() === 'DELETE' &&
+      (!deletesNotOnMac || notOnMacAcknowledged) &&
       !deleting
   );
 
@@ -752,8 +1014,8 @@
             <label>
               <input
                 type="checkbox"
-                checked={selectedChatIds.has(chat.rowid)}
-                onchange={() => toggleChat(chat.rowid)}
+                checked={isChatSelected(chat)}
+                onchange={() => toggleChat(chat)}
               />
               <span class="name">{displayName(chat)}</span>
               <span class="meta">
@@ -845,7 +1107,7 @@
         <select bind:value={format} disabled={running}>
           <option value="json">JSON (line-delimited, one file per conversation)</option>
           <option value="html">HTML (self-contained per conversation)</option>
-          <option value="pdf">PDF (one file per conversation)</option>
+          <option value="pdf">PDF (one file per conversation; not a full backup)</option>
           <option value="txt">TXT (plain text per conversation)</option>
         </select>
       </label>
@@ -869,8 +1131,55 @@
       Copy attachment files into the backup folder
     </label>
 
+    <label class="checkbox">
+      <input type="checkbox" bind:checked={encryptBackup} disabled={running} />
+      Encrypt this backup (AES-256 disk image, opened with a password)
+    </label>
+    {#if encryptBackup}
+      <div class="field">
+        <label class="grow">
+          Password
+          <input
+            type="password"
+            bind:value={backupPassword}
+            disabled={running}
+            autocomplete="new-password"
+          />
+        </label>
+        <label class="grow">
+          Confirm password
+          <input
+            type="password"
+            bind:value={backupPasswordConfirm}
+            disabled={running}
+            autocomplete="new-password"
+          />
+        </label>
+      </div>
+      {#if passwordProblem && (backupPassword || backupPasswordConfirm)}
+        <p class="meta">{passwordProblem}</p>
+      {/if}
+      <p class="meta">
+        The backup is saved as a <code>.sparsebundle</code> you open in Finder with this password.
+        <strong>If you forget the password, the backup can't be opened</strong> — keep it in your
+        password manager.
+      </p>
+    {:else}
+      <p class="meta">
+        This backup won't be encrypted: anyone who can open the folder can read every message and
+        attachment in it.
+      </p>
+      {#if destinationRisk}
+        <p class="err">{destinationRisk}</p>
+      {/if}
+    {/if}
+
     <div class="actions">
-      <button class="primary" onclick={runBackup} disabled={running || !destination}>
+      <button
+        class="primary"
+        onclick={runBackup}
+        disabled={running || !destination || !!dateFilterError || !!passwordProblem}
+      >
         {running ? 'Running…' : 'Run backup'}
       </button>
     </div>
@@ -899,25 +1208,76 @@
 
     {#if runResult}
       <div class="summary">
-        <p class="ok">Backup complete — {runResult.format.toUpperCase()}.</p>
+        <p class="ok">Backup {runResult.attachmentCopy && runResult.attachmentCopy.failed > 0 ? 'finished with errors' : 'complete'} — {runResult.format.toUpperCase()}.</p>
+        {#if runResult.encrypted}
+          <p class="meta">
+            Saved in an encrypted disk image. Double-click it in Finder and enter your password to
+            open it.
+          </p>
+        {/if}
+        {#if !runResult.countsForDelete}
+          <p class="meta">
+            PDF can only store basic Latin text — emoji, smart quotes and non-Latin scripts come out
+            as “?” — so it doesn't count as a backup for the delete step. Use JSON or HTML for that.
+          </p>
+        {/if}
         <ul>
           <li>{runResult.messageCount.toLocaleString()} messages</li>
           <li>{runResult.conversationCount.toLocaleString()} conversations</li>
-          <li>
-            {runResult.attachmentCount.toLocaleString()} attachments
-            {#if runResult.attachmentBytesCopied > 0}
-              ({formatBytes(runResult.attachmentBytesCopied)} copied)
+          {#if runResult.attachmentCopy}
+            {@const ac = runResult.attachmentCopy}
+            <li>
+              {ac.copied.toLocaleString()} of {ac.attempted.toLocaleString()} attachments copied
+              ({formatBytes(ac.bytes)})
+            </li>
+            {#if ac.notOnMac > 0}
+              <li>
+                {ac.notOnMac.toLocaleString()} not downloaded to this Mac (not in this backup)
+              </li>
             {/if}
-          </li>
+            {#if ac.unresolvable > 0}
+              <li>{ac.unresolvable.toLocaleString()} with no file to copy</li>
+            {/if}
+          {:else}
+            <li>
+              {runResult.attachmentCount.toLocaleString()} attachments (referenced, not copied)
+            </li>
+          {/if}
+          <li>Saved to <code>{runResult.exportPath}</code></li>
           {#if runResult.manifestPath}
             <li>
               Manifest: <code>{runResult.manifestPath}</code>
             </li>
           {/if}
         </ul>
+        {#if runResult.attachmentCopy && runResult.attachmentCopy.failed > 0}
+          <p class="err">
+            {runResult.attachmentCopy.failed.toLocaleString()} attachment{runResult.attachmentCopy
+              .failed === 1
+              ? ''
+              : 's'} failed to copy:
+          </p>
+          <ul class="meta">
+            {#each runResult.attachmentCopy.failures as f, i (i)}
+              <li><code>{f}</code></li>
+            {/each}
+          </ul>
+        {/if}
       </div>
     {/if}
   </section>
+
+  {#snippet reactionNote()}
+    {#if deletePreview && deletePreview.reactionCount > 0}
+      <p class="meta">
+        Includes {deletePreview.reactionCount.toLocaleString()} tapback{deletePreview.reactionCount ===
+        1
+          ? ''
+          : 's'} outside the filter on messages being deleted, so the backup preview above shows
+        fewer messages.
+      </p>
+    {/if}
+  {/snippet}
 
   <section class="card danger">
     <header class="card-head">
@@ -931,6 +1291,13 @@
       </p>
       <button onclick={expandDelete}>Show delete controls</button>
     {:else}
+      {#if safety?.legacySnapshotDir}
+        <p class="meta">
+          Earlier versions of Bubble Wrap kept full copies of your messages in
+          <code>{safety.legacySnapshotDir}</code>, which may sync to iCloud Drive. New snapshots go
+          to the app's own folder; delete the old ones if you don't need them.
+        </p>
+      {/if}
       {#if safety?.messagesRunning}
         <p class="err" style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;">
           <span>The Messages app is currently running. Please quit it before deleting messages.</span>
@@ -957,20 +1324,26 @@
       {/if}
       {#if safety?.icloudMessages === 'enabled'}
         <p class="err">
-          <strong>Messages in iCloud is enabled.</strong> Deletes on this Mac will replicate to all
-          your other devices signed into the same Apple ID. Disable it in
-          <strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong> if you
-          want local-only deletion.
+          <strong>Messages in iCloud is enabled.</strong> The Messages database records every
+          deletion for iCloud sync, so when Messages next syncs, these messages and attachments are
+          expected to be deleted from iCloud and from your other devices too — not just this Mac. If
+          you only want to free up space here, this isn't the right tool while Messages in iCloud is
+          on (<strong>System Settings → [your name] → iCloud → Show More Apps → Messages</strong>).
         </p>
         <label class="checkbox">
           <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
-          I understand deletes will sync to my other devices and want to proceed anyway.
+          I understand this will likely delete them from iCloud and all my devices.
         </label>
       {:else if safety?.icloudMessages === 'unknown'}
         <p class="meta">
-          Couldn't confirm Messages-in-iCloud state. If it's enabled, deletes will replicate to your
-          other devices.
+          Couldn't confirm Messages-in-iCloud state. If it's enabled, deletions are recorded for
+          iCloud sync and are expected to remove these messages from iCloud and your other devices
+          too.
         </p>
+        <label class="checkbox">
+          <input type="checkbox" bind:checked={icloudAcknowledged} disabled={deleting} />
+          I've checked Messages in iCloud myself and want to proceed.
+        </label>
       {/if}
 
       <div>
@@ -979,14 +1352,32 @@
           Delete messages
         </label>
         <label class="checkbox">
-          <input type="checkbox" bind:checked={deleteAttachments} disabled={deleting} />
+          <input
+            type="checkbox"
+            bind:checked={deleteAttachments}
+            disabled={deleting || deleteMessages}
+          />
           Delete attachment files
         </label>
+        {#if deleteMessages}
+          <p class="meta">
+            Deleting messages always deletes their attachments too — the Messages database does
+            this itself. To keep conversations and only free up attachment space, untick “Delete
+            messages”.
+          </p>
+        {/if}
       </div>
 
-      {#if deletePreviewing}
+      {#if dateFilterError}
+        <p class="err">Fix the date filter above before deleting: {dateFilterError}.</p>
+      {:else if deletePreviewing || (deletePreview && !deletePreviewCurrent)}
+        <!-- Never show counts computed for a different filter. -->
         <p class="meta preview-counting">Counting…</p>
       {:else if deletePreview}
+        <p class="meta">
+          Applies to <strong>{deleteScopeDescription}</strong>{#if selectedChatNames.length > 0 && chatSearch.trim()}
+            — including selected conversations hidden by the search{/if}.
+        </p>
         {#if deleteMessages && deleteAttachments}
           <p>
             Will delete <strong>{deletePreview.messageCount.toLocaleString()}</strong> messages and
@@ -994,11 +1385,7 @@
             ({formatBytes(deletePreview.attachmentBytes)} on disk across
             {deletePreview.onDiskFileCount.toLocaleString()} files).
           </p>
-        {:else if deleteMessages}
-          <p>
-            Will delete <strong>{deletePreview.messageCount.toLocaleString()}</strong> messages.
-            Attachment records and files will be left on disk.
-          </p>
+          {@render reactionNote()}
         {:else if deleteAttachments}
           <p>
             Will delete <strong>{deletePreview.attachmentCount.toLocaleString()}</strong> attachment
@@ -1010,10 +1397,42 @@
           <p class="meta">Select at least one option above.</p>
         {/if}
 
-        {#if !runResult}
+        {#if deletesNotOnMac && deletePreview}
+          <p class="err">
+            {deletePreview.notOnMacCount.toLocaleString()} attachment{deletePreview.notOnMacCount ===
+            1
+              ? ''
+              : 's'} in this delete {deletePreview.notOnMacCount === 1 ? "isn't" : "aren't"} downloaded
+            to this Mac, so no backup can include {deletePreview.notOnMacCount === 1 ? 'it' : 'them'}.
+            Deleting removes the only way to download {deletePreview.notOnMacCount === 1
+              ? 'it'
+              : 'them'} again. Open those conversations in Messages to download first.
+          </p>
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={notOnMacAcknowledged} disabled={deleting} />
+            Delete them anyway — I accept they can't be recovered.
+          </label>
+        {/if}
+
+        {#if backupCoversDelete && coverage?.exportPath}
+          <p class="meta">Backed up in <code>{coverage.exportPath}</code>.</p>
+        {/if}
+        {#if !backupCoversDelete}
           <p class="meta">
-            Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
-            you're about to remove.
+            {#if coverage?.covered && runResult?.attachmentCopy && runResult.attachmentCopy.failed > 0}
+              Some attachments failed to copy during your backup, so it doesn't protect them. Fix
+              the errors listed in Step 4 and re-run the backup, or delete without that protection.
+            {:else if coverage?.covered}
+              Your backup of these messages didn't copy every attachment file. Deleted attachments
+              can't be restored from the safety snapshot — re-run the backup (Step 4) with
+              attachments copied.
+            {:else if runResult}
+              These messages have changed since your backup (new messages may have arrived), so it
+              no longer covers everything this delete would remove. Re-run the backup (Step 4).
+            {:else}
+              Tip: run a backup first (Step 4). Without a backup you have no way to restore the data
+              you're about to remove.
+            {/if}
           </p>
           <label class="checkbox">
             <input
@@ -1024,6 +1443,19 @@
             I understand and want to delete without a backup.
           </label>
         {/if}
+
+        <div class="field">
+          <label>
+            <span>Type <strong>DELETE</strong> to confirm</span>
+            <input
+              type="text"
+              bind:value={typedConfirmation}
+              disabled={deleting}
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+        </div>
 
         <div class="actions">
           <button class="danger" onclick={runDelete} disabled={!deleteReady}>
@@ -1039,12 +1471,20 @@
       {#if deleteResult}
         <div class="summary">
           <p class="ok">Delete complete.</p>
+          {#if !deleteResult.backupVerified}
+            <p class="err">
+              This delete was not covered by a backup. Only the database snapshot below can undo
+              it, and deleted attachment files can't be restored.
+            </p>
+          {/if}
           <ul>
             <li>{deleteResult.messagesDeleted.toLocaleString()} messages</li>
             <li>
               {deleteResult.attachmentsDeleted.toLocaleString()} attachments
               ({deleteResult.onDiskFilesRemoved.toLocaleString()} files removed from disk{#if deleteResult.onDiskFilesFailed > 0}
                 , {deleteResult.onDiskFilesFailed.toLocaleString()} failed
+              {/if}{#if deleteResult.onDiskFilesSkipped > 0}
+                , {deleteResult.onDiskFilesSkipped.toLocaleString()} skipped (outside the Messages folders)
               {/if})
             </li>
             <li>
@@ -1061,8 +1501,48 @@
               Snapshot: <code>{deleteResult.snapshotPath}</code>
             </li>
           </ul>
+          <p class="meta">
+            To undo, use “Restore a snapshot” below. Deleted attachment files aren't in the
+            snapshot — restore them from your backup.
+          </p>
         </div>
       {/if}
+
+      <div class="restore">
+        <h3>Restore a snapshot</h3>
+        <p class="meta">
+          A copy of the Messages database is saved before every delete and cleanup. Restoring one
+          brings back the messages it holds; attachment files come back only from your backup.
+        </p>
+        {#if snapshots === null}
+          <p class="meta">Loading…</p>
+        {:else if snapshots.length === 0}
+          <p class="meta">No snapshots yet.</p>
+        {:else}
+          <ul class="snapshot-list">
+            {#each snapshots as snap (snap.path)}
+              <li>
+                <span>
+                  <strong>{new Date(snap.takenAtUnix * 1000).toLocaleString()}</strong>
+                  · {snapshotKindLabel[snap.kind]} · {formatBytes(snap.bytes)}
+                </span>
+                <button onclick={() => restoreSnapshot(snap)} disabled={restoring || deleting}>
+                  {restoring ? 'Restoring…' : 'Restore'}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if restoreError}
+          <p class="err">{restoreError}</p>
+        {/if}
+        {#if restoreResult}
+          <p class="ok">
+            Restored. The database from just before the restore was saved too (listed above as
+            “Before a restore”), so you can undo this. Reopen Messages to see the result.
+          </p>
+        {/if}
+      </div>
     {/if}
   </section>
 
@@ -1098,6 +1578,35 @@
             <span class="orphan-size">{formatBytes(orphanScan.fsOrphanBytes)}</span>
           </div>
         </div>
+        {#if orphanScan.retainedCount > 0 || orphanIncludeRetained}
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={orphanIncludeRetained}
+              onchange={(e) => startOrphanScan(e.currentTarget.checked)}
+            />
+            Also remove attachments kept by earlier "messages only" deletes{#if !orphanIncludeRetained}
+              ({orphanScan.retainedCount.toLocaleString()}, {formatBytes(orphanScan.retainedBytes)}){/if}
+          </label>
+        {/if}
+        <p class="meta">
+          Quit Messages before cleaning. Folders that still hold a referenced attachment, files
+          changed in the last 24 hours and records created in the last 24 hours are left alone.
+          chat.db is snapshotted before any records are removed, but removed files can't be
+          restored.
+        </p>
+        {#if orphanNeedsIcloudAck}
+          <p class="err">
+            {orphanIcloud === 'enabled'
+              ? 'Messages in iCloud is enabled.'
+              : "Couldn't confirm whether Messages in iCloud is enabled."} Removing attachment records
+            queues them for deletion in iCloud, which can remove them from your other devices too.
+          </p>
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={orphanIcloudAck} />
+            I understand and want to remove them anyway.
+          </label>
+        {/if}
         <p class="orphan-total">
           {#if totalOrphanItems === 0}
             No orphaned data found.
@@ -1108,7 +1617,11 @@
         </p>
         <div class="actions">
           {#if totalOrphanItems > 0}
-            <button class="danger" onclick={runOrphanClean}>
+            <button
+              class="danger"
+              onclick={runOrphanClean}
+              disabled={orphanNeedsIcloudAck && !orphanIcloudAck}
+            >
               Delete {totalOrphanItems.toLocaleString()} item{totalOrphanItems === 1 ? '' : 's'}
             </button>
           {/if}
@@ -1134,6 +1647,14 @@
                 {filesRemoved.toLocaleString()} file{filesRemoved === 1 ? '' : 's'} removed from
                 disk{#if filesFailed > 0}, {filesFailed.toLocaleString()} failed{/if}
               </li>
+            {/if}
+            {#if orphanResult.filesSkipped > 0}
+              <li>
+                {orphanResult.filesSkipped.toLocaleString()} skipped (outside the Messages folders)
+              </li>
+            {/if}
+            {#if orphanResult.snapshotPath}
+              <li>Snapshot: <code>{orphanResult.snapshotPath}</code></li>
             {/if}
           </ul>
         </div>
@@ -1262,6 +1783,7 @@
   }
   .field input[type='search'],
   .field input[type='text'],
+  .field input[type='password'],
   .field select {
     padding: 7px 10px;
     font: inherit;
@@ -1550,6 +2072,33 @@
     font-size: 15px;
     font-weight: 600;
     letter-spacing: -0.01em;
+  }
+
+  .restore {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  }
+
+  .restore h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+
+  .snapshot-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .snapshot-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
   }
 
   .orphan-rows {

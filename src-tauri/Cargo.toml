@@ -20,24 +20,24 @@ tauri-build = { version = "2.0", features = [] }
 [dependencies]
 tauri = { version = "2.1", features = [] }
 tauri-plugin-dialog = "2.2"
-tauri-plugin-shell = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-util = "0.7"
 chrono = "0.4"
+fs2 = "0.4"
 
-# Library crate from the sibling repository. Uses path dep against the user's
-# fork (dbpecka/imessage-exporter); features are added as the app grows.
+# Library crate from the fork (dbpecka/imessage-exporter), pinned to an exact
+# commit so a signed build can't silently pick up whatever is on `develop`.
+# To bump it, update `rev` after reviewing the fork's changes.
 #
-# TODO(C3): once the Phase 5b vendoring is committed in the fork, add a
-# pinned `git` + `rev` (or a versioned `version = "x.y"`) alongside `path`
-# so reproducible builds don't silently change when the fork's working tree
-# moves. Today the fork's develop branch HEAD (b60ecc9) predates the
-# vendored `exporters` and `write` modules this app requires, so there is
-# no rev to pin — pinning is blocked on committing the fork first.
-imessage-database = { path = "../../imessage-exporter/imessage-database", features = ["export", "write"] }
+# To develop against a local checkout of the fork instead, create
+# `src-tauri/.cargo/config.toml` (git-ignored) with:
+#
+#   [patch."https://github.com/dbpecka/imessage-exporter"]
+#   imessage-database = { path = "../../imessage-exporter/imessage-database" }
+imessage-database = { git = "https://github.com/dbpecka/imessage-exporter", rev = "cffac6a59099f8c1398c4089bd20fe222d983fa0", features = ["export", "write"] }
 rusqlite = { version = "0.39", features = ["backup"] }
 
 [dev-dependencies]

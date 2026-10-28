@@ -69,6 +69,8 @@ export type ChatSummary = {
   participantCount: number;
   participantHandles: string[];
   messageCount: number;
+  /** Every chat row in this conversation (e.g. iMessage + SMS); filter by all of them. */
+  chatIds: number[];
 };
 
 export type ContactSummary = {
@@ -79,12 +81,8 @@ export type ContactSummary = {
 export type FilterSpec = {
   dateRange?: { start?: string; end?: string };
   chatIds?: number[];
-  handleIds?: number[];
-  attachments?: {
-    types?: ('image' | 'video' | 'audio' | 'other')[];
-    minBytes?: number;
-    maxBytes?: number;
-  };
+  // Contact (handle) and attachment-type filters aren't applied by the
+  // backend yet; it rejects them rather than silently widening a delete.
 };
 
 export type BackupPreview = {
@@ -104,6 +102,8 @@ export type RunBackupArgs = {
   format: ExportFormat;
   destination: string;
   copyAttachments?: boolean;
+  /** Write into a new AES-256 encrypted disk image protected by this password. */
+  encryptPassword?: string;
 };
 
 export type BackupResult = {
@@ -114,6 +114,27 @@ export type BackupResult = {
   manifestPath: string;
   exportPath: string;
   format: string;
+  /** Whether every attachment on this Mac was copied (none failed). */
+  includesAttachments: boolean;
+  /** Per-attachment copy outcomes; null when attachments weren't copied. */
+  attachmentCopy: AttachmentCopySummary | null;
+  /** False for PDF: it can't store non-Latin-1 text, so it isn't a full backup. */
+  countsForDelete: boolean;
+  /** True when exportPath is an encrypted .sparsebundle. */
+  encrypted: boolean;
+};
+
+export type AttachmentCopySummary = {
+  attempted: number;
+  copied: number;
+  bytes: number;
+  /** File isn't on this Mac (typically offloaded to iCloud). */
+  notOnMac: number;
+  /** Record has no file path at all. */
+  unresolvable: number;
+  failed: number;
+  /** The first few failures, as "path: reason". */
+  failures: string[];
 };
 
 export type ProgressPayload = {
@@ -128,6 +149,8 @@ export type ICloudState = 'enabled' | 'disabled' | 'unknown';
 export type SafetyStatus = {
   messagesRunning: boolean;
   icloudMessages: ICloudState;
+  /** Folder of chat.db copies left by earlier versions, if any remain. */
+  legacySnapshotDir: string | null;
 };
 
 export type DeletePreview = {
@@ -135,20 +158,36 @@ export type DeletePreview = {
   attachmentCount: number;
   attachmentBytes: number;
   onDiskFileCount: number;
+  /** Matched attachments whose file isn't downloaded to this Mac. */
+  notOnMacCount: number;
+  /** Of messageCount: tapbacks outside the filter on messages being deleted. */
+  reactionCount: number;
 };
 
-export type DeleteScope = 'both' | 'messages_only' | 'attachments_only';
+/** Deleting messages always deletes their attachments (chat.db's triggers do it). */
+export type DeleteScope = 'both' | 'attachments_only';
 
 export type RunDeleteArgs = {
   filter: FilterSpec;
   confirmationPhrase: string;
-  backupVerified?: boolean;
-  /** Required by the backend when backupVerified is false. */
+  /**
+   * Required unless a backup with this exact filter ran this session (and,
+   * when attachment files are deleted, copied attachments). The backend
+   * checks its own record of completed backups.
+   */
   acknowledgeSkipBackup?: boolean;
   snapshotRoot?: string;
   deleteScope?: DeleteScope;
-  /** Must be true when Messages in iCloud is enabled. Required by the backend. */
+  /** Must be true unless Messages in iCloud is detected as disabled. */
   acknowledgeIcloudSync?: boolean;
+  /** Required when deleting attachments whose files aren't on this Mac. */
+  acknowledgeNotOnMac?: boolean;
+  /**
+   * Counts the user confirmed (0 for parts the scope keeps). The backend
+   * refuses if its plan differs, e.g. because the filter changed.
+   */
+  expectedMessageCount?: number;
+  expectedAttachmentCount?: number;
 };
 
 export type DeleteResult = {
@@ -161,7 +200,32 @@ export type DeleteResult = {
   snapshotPath: string;
   onDiskFilesRemoved: number;
   onDiskFilesFailed: number;
+  onDiskFilesSkipped: number;
   backupVerified: boolean;
+};
+
+/** Whether completed backups (from any session) cover what a filter matches now. */
+export type BackupCoverage = {
+  covered: boolean;
+  /** …and that backup copied every attachment file. */
+  withAttachments: boolean;
+  exportPath: string | null;
+};
+
+export type SnapshotKind = 'delete' | 'orphanClean' | 'preRestore';
+
+export type SnapshotInfo = {
+  path: string;
+  kind: SnapshotKind;
+  /** When its chat.db was written, Unix seconds. */
+  takenAtUnix: number;
+  bytes: number;
+};
+
+export type RestoreResult = {
+  restoredFrom: string;
+  /** The database just before the restore, so the restore can be undone. */
+  preRestoreSnapshot: string;
 };
 
 export type OrphanScan = {
@@ -169,6 +233,11 @@ export type OrphanScan = {
   dbOrphanBytes: number;
   fsOrphanCount: number;
   fsOrphanBytes: number;
+  /** Attachments kept by earlier messages-only deletes (excluded unless asked). */
+  retainedCount: number;
+  retainedBytes: number;
+  /** Pass back to cleanOrphans; it refuses if the orphans changed since. */
+  fingerprint: string;
 };
 
 export type OrphanCleanResult = {
@@ -177,6 +246,8 @@ export type OrphanCleanResult = {
   dbFilesFailed: number;
   fsFilesRemoved: number;
   fsFilesFailed: number;
+  filesSkipped: number;
+  snapshotPath: string | null;
 };
 
 
@@ -192,6 +263,15 @@ export const api = {
   safetyStatus: () => invoke<SafetyStatus>('safety_status'),
   previewDelete: (filter: FilterSpec) => invoke<DeletePreview>('preview_delete', { filter }),
   runDelete: (args: RunDeleteArgs) => invoke<DeleteResult>('run_delete', { args }),
-  scanOrphans: () => invoke<OrphanScan>('scan_orphans'),
-  cleanOrphans: () => invoke<OrphanCleanResult>('clean_orphans'),
+  backupCoverage: (filter: FilterSpec) =>
+    invoke<BackupCoverage>('backup_coverage', { filter }),
+  listSnapshots: () => invoke<SnapshotInfo[]>('list_snapshots'),
+  restoreSnapshot: (snapshotPath: string, acknowledgeIcloudSync: boolean) =>
+    invoke<RestoreResult>('restore_snapshot', { args: { snapshotPath, acknowledgeIcloudSync } }),
+  scanOrphans: (includeRetained = false) =>
+    invoke<OrphanScan>('scan_orphans', { includeRetained }),
+  cleanOrphans: (scanFingerprint: string, includeRetained = false, acknowledgeIcloudSync = false) =>
+    invoke<OrphanCleanResult>('clean_orphans', {
+      args: { scanFingerprint, includeRetained, acknowledgeIcloudSync }
+    }),
 };

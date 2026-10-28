@@ -4,4 +4,5 @@ pub mod discover;
 pub mod fda;
 pub mod orphans;
 pub mod preview;
+pub mod restore;
 pub mod safety;
