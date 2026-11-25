@@ -42,10 +42,8 @@ origin URL); cargo fetches the pinned commit. Bump `rev` deliberately after
 reviewing the fork's changes. For local work on the fork, use the `[patch]`
 override described in `Cargo.toml`.
 
-The pin currently points at the fork's `claude/security-deps` branch
-(dependency updates for RUSTSEC advisories in SQLite, quick-xml and lopdf).
-Merge that branch into the fork's `develop` so the pinned commit can't be
-lost if the branch is deleted. `cargo audit` and `npm audit` report no
+The pin points at the fork's `develop` (commit `92e37a3`: dependency
+updates for RUSTSEC advisories in SQLite, quick-xml and lopdf). `cargo audit` and `npm audit` report no
 vulnerabilities as of this change; the remaining `cargo audit` warnings
 are unmaintained or unsound crates deep in Tauri's dependency tree with no
 fix available.
