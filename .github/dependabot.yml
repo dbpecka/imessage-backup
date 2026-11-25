@@ -4,6 +4,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # SvelteKit's peer range decides the TypeScript major; move it
+      # together with a SvelteKit upgrade.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # The app targets Node 22 (see "engines" in package.json).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       # The Tauri JS packages must stay on the same minor version as the
       # Rust tauri crates; update both sides together.
