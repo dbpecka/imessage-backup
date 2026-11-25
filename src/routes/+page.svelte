@@ -1217,8 +1217,8 @@
         {/if}
         {#if !runResult.countsForDelete}
           <p class="meta">
-            PDF can only store basic Latin text — emoji, smart quotes and non-Latin scripts come out
-            as “?” — so it doesn't count as a backup for the delete step. Use JSON or HTML for that.
+            PDF can only store Western European text — emoji and other scripts come out as “?” —
+            so it doesn't count as a backup for the delete step. Use JSON or HTML for that.
           </p>
         {/if}
         <ul>

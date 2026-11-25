@@ -118,7 +118,7 @@ export type BackupResult = {
   includesAttachments: boolean;
   /** Per-attachment copy outcomes; null when attachments weren't copied. */
   attachmentCopy: AttachmentCopySummary | null;
-  /** False for PDF: it can't store non-Latin-1 text, so it isn't a full backup. */
+  /** False for PDF: it can't store emoji or non-Western-European text, so it isn't a full backup. */
   countsForDelete: boolean;
   /** True when exportPath is an encrypted .sparsebundle. */
   encrypted: boolean;

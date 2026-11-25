@@ -66,7 +66,7 @@ For each format (JSON, HTML, TXT; PDF last):
 - [ ] Copied attachments keep their original dates in Finder.
 - [ ] HTML: the conversation renders; note whether HEIC images display
       inline (known: browsers may not show HEIC).
-- [ ] PDF: emoji/non-Latin text shows as `?`, and the result says PDF
+- [ ] PDF: emoji/non-Latin text shows as `?`, smart quotes show correctly, and the result says PDF
       doesn't count as a backup for deleting.
 - [ ] Back up the same conversation to an **external drive**: accepted, and
       the UI warns that the drive isn't protected.

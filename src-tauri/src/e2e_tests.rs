@@ -625,7 +625,7 @@ fn scan_and_clean(
 #[test]
 fn pdf_backup_does_not_count_for_delete() {
     let env = Env::new();
-    // The PDF writer can only store Latin-1: this would come out as `?`.
+    // The PDF writer can only store Windows-1252: all but `it’s` comes out as `?`.
     env.add_message(6, 2, 2, apple_date(2020, 7, 1), "Привет 😀 it’s");
     let b = env.backup(chat(2), "pdf");
     assert!(!b.counts_for_delete);

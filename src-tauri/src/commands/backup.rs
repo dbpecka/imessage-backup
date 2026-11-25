@@ -159,8 +159,8 @@ pub struct BackupResult {
     /// Per-attachment copy outcomes; `None` when attachments weren't copied.
     pub attachment_copy: Option<CopySummary>,
     /// Whether this backup counts toward the delete step's backup check.
-    /// PDF backups don't: the PDF writer can only store Latin-1 text, so
-    /// emoji, smart quotes and non-Latin scripts come out as `?`.
+    /// PDF backups don't: the PDF writer can only store Windows-1252
+    /// text, so emoji and other scripts come out as `?`.
     pub counts_for_delete: bool,
     /// Whether the backup is inside an encrypted disk image (`export_path`
     /// is then the `.sparsebundle`; open it in Finder with the password).
