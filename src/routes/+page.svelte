@@ -23,7 +23,7 @@
     type OrphanCleanResult,
     appErrorMessage,
     isFdaError
-  } from '$lib/ipc';
+  } from '#lib/ipc.ts';
 
   // FDA (Full Disk Access) gate. The app is unusable without it, so we
   // auto-detect on launch and on window focus (user returns from Settings).

@@ -95,7 +95,7 @@ iCloud Messages sync state is detected via `defaults read com.apple.Messages ICl
 ### Prerequisites
 
 - Rust (stable)
-- Node.js + npm
+- Node.js 22.17+ and npm
 - Nothing else: cargo fetches the pinned `imessage-exporter` fork itself. To work on the fork locally, see the `[patch]` note in `src-tauri/Cargo.toml`.
 
 ### Run in development
