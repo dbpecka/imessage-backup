@@ -175,10 +175,19 @@ pub fn prune_snapshots(root: &Path, keep: usize, just_taken: &Path) -> usize {
 /// Remove snapshot folders under `root` written more than `max_age` before
 /// `now`. Snapshots are full copies of the message history, so they
 /// shouldn't outlive their usefulness as an undo. A snapshot dated in the
-/// future (clock changes) counts as new. Returns how many were removed.
-pub fn expire_snapshots(root: &Path, max_age: Duration, now: SystemTime) -> usize {
-    snapshot_dirs(root)
-        .into_iter()
+/// future (clock changes) counts as new. With `keep_newest`, the newest
+/// snapshot stays however old it is. Returns how many were removed.
+pub fn expire_snapshots(
+    root: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    keep_newest: bool,
+) -> usize {
+    let mut dirs = snapshot_dirs(root);
+    if keep_newest {
+        dirs.pop();
+    }
+    dirs.into_iter()
         .filter(|((written, _, _), _)| now.duration_since(*written).is_ok_and(|age| age > max_age))
         .filter(|(_, dir)| remove_snapshot_dir(dir))
         .count()
@@ -240,14 +249,43 @@ impl SnapshotRetention {
     /// Longest period the setting accepts.
     pub const MAX_DAYS: u32 = 3650;
 
-    /// Load the setting saved at `path`, or the default if there is none.
-    pub fn persistent(path: PathBuf) -> Self {
-        let saved = fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<RetentionFile>(&b).ok())
-            .map_or(Some(Self::DEFAULT_DAYS), |f| f.max_age_days);
+    /// Load the setting saved at `path`. Expiry deletes data, so whenever
+    /// it's unclear what the user wants, snapshots are kept:
+    /// - No setting saved yet (first launch of a version with expiry): if
+    ///   snapshots already exist under `roots`, they were taken when
+    ///   snapshots were kept until replaced, and one may be the only undo of
+    ///   a delete, so that stays the setting. A fresh install gets
+    ///   [`Self::DEFAULT_DAYS`]. Either way the choice is saved, so it
+    ///   doesn't change on a later launch.
+    /// - A setting that can't be read: kept until replaced.
+    pub fn persistent(path: PathBuf, roots: &[(SnapshotKind, PathBuf)]) -> Self {
+        let days = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<RetentionFile>(&bytes) {
+                Ok(f) => f.max_age_days,
+                Err(e) => {
+                    eprintln!("snapshot: unreadable {}: {e}", path.display());
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let existing = roots.iter().any(|(_, r)| !snapshot_dirs(r).is_empty());
+                let days = if existing {
+                    None
+                } else {
+                    Some(Self::DEFAULT_DAYS)
+                };
+                if let Err(e) = save_setting(&path, days) {
+                    eprintln!("snapshot: couldn't save {}: {e}", path.display());
+                }
+                days
+            }
+            Err(e) => {
+                eprintln!("snapshot: couldn't read {}: {e}", path.display());
+                None
+            }
+        };
         Self {
-            max_age_days: Mutex::new(saved),
+            max_age_days: Mutex::new(days),
             path: Some(path),
         }
     }
@@ -269,22 +307,15 @@ impl SnapshotRetention {
             )));
         }
         if let Some(path) = &self.path {
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("json.tmp");
-            fs::write(
-                &tmp,
-                serde_json::to_vec(&RetentionFile { max_age_days: days })
-                    .map_err(|e| AppError::Other(e.to_string()))?,
-            )?;
-            fs::rename(&tmp, path)?;
+            save_setting(path, days)?;
         }
         *self.max_age_days.lock().unwrap_or_else(|p| p.into_inner()) = days;
         Ok(())
     }
 
     /// Remove the snapshots under `roots` that are older than the setting.
+    /// The newest snapshot taken before a delete is always kept: it may be
+    /// the only way to undo that delete. The user can remove it by hand.
     pub fn expire(&self, roots: &[(SnapshotKind, PathBuf)]) -> usize {
         let Some(max_age) = self.max_age() else {
             return 0;
@@ -292,9 +323,27 @@ impl SnapshotRetention {
         let now = SystemTime::now();
         roots
             .iter()
-            .map(|(_, root)| expire_snapshots(root, max_age, now))
+            .map(|(kind, root)| expire_snapshots(root, max_age, now, *kind == SnapshotKind::Delete))
             .sum()
     }
+}
+
+/// Write the setting so a crash mid-write leaves either the old file or
+/// the new one, never a truncated one.
+fn save_setting(path: &Path, days: Option<u32>) -> Result<(), AppError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&RetentionFile { max_age_days: days })
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    {
+        let mut f = fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 impl Default for SnapshotRetention {
@@ -550,7 +599,10 @@ mod tests {
         // Not ours, however old.
         let foreign = snapshot_aged(root, "my-notes", 400 * DAY);
 
-        assert_eq!(expire_snapshots(root, 30 * DAY, SystemTime::now()), 2);
+        assert_eq!(
+            expire_snapshots(root, 30 * DAY, SystemTime::now(), false),
+            2
+        );
         assert!(!old.exists());
         assert!(!old_too.exists());
         assert!(recent.exists());
@@ -562,7 +614,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = snapshot_aged(tmp.path(), "2024-01-01T00-00-00", Duration::ZERO);
         let long_ago = SystemTime::now() - 365 * DAY;
-        assert_eq!(expire_snapshots(tmp.path(), DAY, long_ago), 0);
+        assert_eq!(expire_snapshots(tmp.path(), DAY, long_ago, false), 0);
         assert!(dir.exists());
     }
 
@@ -570,30 +622,72 @@ mod tests {
     fn retention_setting_is_saved_and_applied() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("settings/snapshot_settings.json");
-        let root = tmp.path().join("snaps");
-        let roots = [(SnapshotKind::Delete, root.clone())];
-        let week_old = snapshot_aged(&root, "2024-01-01T00-00-00", 8 * DAY);
+        let delete_root = tmp.path().join("delete");
+        let clean_root = tmp.path().join("clean");
+        let roots = [
+            (SnapshotKind::Delete, delete_root.clone()),
+            (SnapshotKind::OrphanClean, clean_root.clone()),
+        ];
 
-        // Default: 30 days.
-        let r = SnapshotRetention::persistent(file.clone());
+        // Fresh install: 30 days, saved so it doesn't change later.
+        let r = SnapshotRetention::persistent(file.clone(), &roots);
         assert_eq!(r.max_age_days(), Some(SnapshotRetention::DEFAULT_DAYS));
+        let older_delete = snapshot_aged(&delete_root, "2024-01-01T00-00-00", 9 * DAY);
+        let newest_delete = snapshot_aged(&delete_root, "2024-01-02T00-00-00", 8 * DAY);
+        let old_clean = snapshot_aged(&clean_root, "2024-01-01T00-00-00", 8 * DAY);
+        assert_eq!(
+            SnapshotRetention::persistent(file.clone(), &roots).max_age_days(),
+            Some(SnapshotRetention::DEFAULT_DAYS)
+        );
         assert_eq!(r.expire(&roots), 0);
 
         // "Until replaced" survives a relaunch and expires nothing.
         r.set(None).unwrap();
-        let r = SnapshotRetention::persistent(file.clone());
+        let r = SnapshotRetention::persistent(file.clone(), &roots);
         assert_eq!(r.max_age_days(), None);
         assert_eq!(r.expire(&roots), 0);
-        assert!(week_old.exists());
 
+        // A week: the old snapshots go, except the newest one from a delete.
         r.set(Some(7)).unwrap();
-        assert_eq!(SnapshotRetention::persistent(file).max_age_days(), Some(7));
-        assert_eq!(r.expire(&roots), 1);
-        assert!(!week_old.exists());
+        assert_eq!(
+            SnapshotRetention::persistent(file.clone(), &roots).max_age_days(),
+            Some(7)
+        );
+        assert_eq!(r.expire(&roots), 2);
+        assert!(!older_delete.exists());
+        assert!(!old_clean.exists());
+        assert!(newest_delete.exists(), "may be the only undo of a delete");
 
         assert!(r.set(Some(0)).is_err());
         assert!(r.set(Some(SnapshotRetention::MAX_DAYS + 1)).is_err());
         assert_eq!(r.max_age_days(), Some(7), "a refused value changes nothing");
+
+        // A damaged setting keeps snapshots.
+        fs::write(&file, b"{\"maxAgeD").unwrap();
+        assert_eq!(
+            SnapshotRetention::persistent(file, &roots).max_age_days(),
+            None
+        );
+    }
+
+    #[test]
+    fn upgrading_with_existing_snapshots_keeps_them_until_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("snapshot_settings.json");
+        let root = tmp.path().join("delete");
+        let roots = [(SnapshotKind::Delete, root.clone())];
+        // Taken by a version without expiry, long ago.
+        snapshot_aged(&root, "2024-01-01T00-00-00", 90 * DAY);
+        snapshot_aged(&root, "2024-01-02T00-00-00", 60 * DAY);
+
+        let r = SnapshotRetention::persistent(file.clone(), &roots);
+        assert_eq!(r.max_age_days(), None);
+        assert_eq!(r.expire(&roots), 0);
+        // Saved, so the next launch doesn't fall back to the default.
+        assert_eq!(
+            SnapshotRetention::persistent(file, &[]).max_age_days(),
+            None
+        );
     }
 
     #[test]

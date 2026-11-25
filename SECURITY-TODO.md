@@ -80,8 +80,12 @@ kept per kind.
 
 **Done:** snapshots expire. They're removed after 30 days by default
 (1 week, 90 days, or "until replaced" in the Restore section), at launch,
-after each delete, cleanup or restore, and when the setting changes. Any
-snapshot can also be deleted from that list.
+after each delete, cleanup or restore, and when the setting changes (once
+any running operation finishes). The newest snapshot from a delete is
+never expired, since it may be the only undo of that delete. Installs that
+already had snapshots when expiry arrived start on "until replaced", and
+an unreadable setting also means "until replaced". Any snapshot can be
+deleted from the list.
 
 **Still to do:** snapshots are not encrypted, so they can be restored
 without a password prompt; encrypting them at rest would need one.

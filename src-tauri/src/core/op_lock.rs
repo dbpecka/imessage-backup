@@ -13,6 +13,12 @@ use crate::error::AppError;
 pub struct OperationLock(Arc<Mutex<()>>);
 
 impl OperationLock {
+    /// Wait for whatever is running to finish, then hold the lock. For
+    /// housekeeping that must not be refused, only postponed.
+    pub async fn acquire(&self) -> OwnedMutexGuard<()> {
+        self.0.clone().lock_owned().await
+    }
+
     pub fn try_acquire(&self, what: &str) -> Result<OwnedMutexGuard<()>, AppError> {
         self.0.clone().try_lock_owned().map_err(|_| {
             AppError::Other(format!(

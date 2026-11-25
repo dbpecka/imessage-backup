@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::delete::SafetyProbe;
 use crate::core::db_path::{blocking, default_chat_db_path, open_write};
@@ -40,7 +40,13 @@ pub(crate) async fn expire_old_snapshots(app: &AppHandle) {
         return;
     };
     let retention = Arc::clone(&app.state::<Arc<SnapshotRetention>>());
-    let _ = tokio::task::spawn_blocking(move || retention.expire(&roots)).await;
+    let removed = tokio::task::spawn_blocking(move || retention.expire(&roots))
+        .await
+        .unwrap_or(0);
+    if removed > 0 {
+        // A snapshot list on screen may now name folders that are gone.
+        app.emit("snapshots-changed", ()).ok();
+    }
 }
 
 /// How many days snapshots are kept; `None` means until replaced.
@@ -58,10 +64,17 @@ pub async fn set_snapshot_retention(
     days: Option<u32>,
 ) -> Result<(), AppError> {
     retention.set(days)?;
-    // If something is running, its own expiry pass applies the new setting
-    // when it finishes.
-    if let Ok(_guard) = lock.try_acquire("a snapshot cleanup") {
-        expire_old_snapshots(&app).await;
+    match lock.try_acquire("a snapshot cleanup") {
+        Ok(_guard) => expire_old_snapshots(&app).await,
+        // Something is running (a backup, say): apply the new setting as
+        // soon as it finishes.
+        Err(_) => {
+            let lock = lock.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _guard = lock.acquire().await;
+                expire_old_snapshots(&app).await;
+            });
+        }
     }
     Ok(())
 }
@@ -142,7 +155,19 @@ fn resolve_snapshot(
             "{snapshot_path} isn't a Bubble Wrap snapshot. Pick one from the list."
         ))
     };
-    let dir = std::fs::canonicalize(snapshot_path).map_err(|_| refuse())?;
+    let dir = std::fs::canonicalize(snapshot_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            && roots
+                .iter()
+                .any(|(_, root)| Path::new(snapshot_path).parent() == Some(root.as_path()))
+        {
+            AppError::Other(
+                "That snapshot no longer exists (it may have expired or been deleted).".into(),
+            )
+        } else {
+            refuse()
+        }
+    })?;
     let in_a_root = roots.iter().any(|(_, root)| {
         std::fs::canonicalize(root).is_ok_and(|root| dir.parent() == Some(root.as_path()))
     });

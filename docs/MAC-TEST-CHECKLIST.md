@@ -105,10 +105,14 @@ For each format (JSON, HTML, TXT; PDF last):
 - [ ] Restoring while Messages is running is refused.
 - [ ] Delete a snapshot from the list: it's gone from the list and from
       `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/`.
-- [ ] Expiry: in Terminal, backdate a snapshot
-      (`touch -t 202001010000 …/snapshots/delete/<folder>/chat.db`), then
-      relaunch the app: that snapshot is gone. Set "Keep snapshots for" to
-      "until replaced", backdate another, relaunch: it stays.
+- [ ] Upgrading from a version without expiry, with snapshots already
+      there: "Keep snapshots for" shows "until replaced" and nothing is
+      removed.
+- [ ] Expiry: set "Keep snapshots for" to 1 week. Take two deletes, then
+      in Terminal backdate both
+      (`touch -t 202001010000 …/snapshots/delete/<folder>/chat.db`) and
+      relaunch: the older is gone, the newer (newest delete snapshot)
+      stays. Set "until replaced", backdate another, relaunch: it stays.
 
 ## 7. Messages in iCloud (two devices, throwaway Apple ID)
 

@@ -153,6 +153,7 @@
   let orphanIcloud = $state<'enabled' | 'disabled' | 'unknown'>('unknown');
   let orphanIcloudAck = $state(false);
   let unlistenMenuClean: UnlistenFn | null = null;
+  let unlistenSnapshots: UnlistenFn | null = null;
   let orphanModalCard = $state<HTMLDivElement | null>(null);
 
   // Modal can be dismissed by the user only when no destructive work is in
@@ -252,12 +253,20 @@
     listen('menu:clean-orphans', () => startOrphanScan(false)).then((fn) => {
       unlistenMenuClean = fn;
     });
+    // Expired snapshots were removed (at launch, or once a running
+    // operation finished): refresh the list if it's showing.
+    listen('snapshots-changed', () => {
+      if (snapshots !== null) void loadSnapshots();
+    }).then((fn) => {
+      unlistenSnapshots = fn;
+    });
   });
 
   onDestroy(() => {
     unlistenProgress?.();
     unlistenFocus?.();
     unlistenMenuClean?.();
+    unlistenSnapshots?.();
   });
 
   async function checkFda() {
@@ -601,6 +610,7 @@
     } catch (err) {
       if (routeFdaError(err)) return;
       restoreError = appErrorMessage(err);
+      void loadSnapshots();
     } finally {
       deletingSnapshot = false;
     }
@@ -638,6 +648,8 @@
     } catch (err) {
       if (routeFdaError(err)) return;
       restoreError = appErrorMessage(err);
+      // The snapshot may have expired since the list was loaded.
+      void loadSnapshots();
     } finally {
       restoring = false;
     }
@@ -831,6 +843,11 @@
         .then((s) => s.icloudMessages)
         .catch(() => 'unknown' as const);
       orphanScan = await api.scanOrphans(includeRetained);
+      // Access was revoked while the scan ran: stay on the permission step.
+      if (fda !== 'granted') {
+        orphanModal = null;
+        return;
+      }
       orphanModal = 'preview';
     } catch (err) {
       if (routeFdaError(err)) return;
@@ -1597,7 +1614,8 @@
           <p class="meta">
             Snapshots are full, unencrypted copies of your message history, kept in the app's own
             data folder (not synced). Only the 5 newest of each kind are kept, and older ones are
-            removed after this period.
+            removed after this period — except the newest snapshot from a delete, which stays until
+            you delete it, since it may be the only way to undo that delete.
           </p>
         {/if}
         {#if snapshots === null}

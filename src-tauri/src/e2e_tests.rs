@@ -1151,4 +1151,8 @@ fn a_snapshot_can_be_deleted_but_nothing_else_can() {
     crate::commands::restore::delete_snapshot_now(&roots, &r.snapshot_path).unwrap();
     assert!(!Path::new(&r.snapshot_path).exists());
     assert!(crate::core::snapshot::list_snapshots(&roots).is_empty());
+
+    // A list on screen can still name it: say what happened.
+    let err = restore(&env, &r.snapshot_path, &quiet_mac()).unwrap_err();
+    assert!(matches!(err, AppError::Other(m) if m.contains("no longer exists")));
 }

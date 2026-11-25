@@ -25,11 +25,16 @@ pub fn run() {
             };
             app.manage(std::sync::Arc::new(receipts));
 
-            let retention = match app.path().app_data_dir() {
-                Ok(dir) => core::snapshot::SnapshotRetention::persistent(
+            let retention = match (
+                app.path().app_data_dir(),
+                commands::restore::snapshot_roots(app.handle()),
+            ) {
+                (Ok(dir), Ok(roots)) => core::snapshot::SnapshotRetention::persistent(
                     dir.join("snapshot_settings.json"),
+                    &roots,
                 ),
-                Err(_) => core::snapshot::SnapshotRetention::default(),
+                // Without a data folder there are no snapshots to expire.
+                _ => core::snapshot::SnapshotRetention::default(),
             };
             app.manage(std::sync::Arc::new(retention));
             // Remove snapshots that expired while the app was closed.
