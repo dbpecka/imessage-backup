@@ -10,3 +10,11 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/.cargo/
 **/*.rs.bk
+
+# Editor, IDE and local tooling state
+.idea/
+*.iml
+.vscode/
+xcuserdata/
+errors.txt
+*.log

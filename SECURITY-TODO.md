@@ -42,22 +42,21 @@ origin URL); cargo fetches the pinned commit. Bump `rev` deliberately after
 reviewing the fork's changes. For local work on the fork, use the `[patch]`
 override described in `Cargo.toml`.
 
-## 4. Don't publish the whole `public/` directory
+## 4. Done: website serves only the site
 
-**File:** `public/docker-compose.yml`
+The site's files moved to `public/site/`, and `public/docker-compose.yml`
+mounts only that folder as nginx's web root, so the compose file and any
+editor folders next to it are no longer published.
 
-nginx mounts `.` (all of `public/`) as the web root, which publishes
-`public/.idea/` and `docker-compose.yml` itself.
+**If the site is deployed some other way** (copying `public/` somewhere),
+point that at `public/site/` instead.
 
-**Fix:** move site assets into a dedicated subfolder (e.g. `public/site/`)
-and mount only that, or add an nginx `location ~ /\. { deny all; }` rule and
-remove `public/.idea/` from the repo.
+## 5. Done: repo hygiene
 
-## 5. Repo hygiene
-
-Committed files that shouldn't be: `errors.txt`, `.idea/`, `public/.idea/`,
-`BubbleWrap.xcodeproj/project.xcworkspace/xcuserdata/`. Remove them and add
-to `.gitignore` so local paths/usernames and dev logs don't leak.
+`errors.txt`, `.idea/`, `public/.idea/` and Xcode's per-user
+`xcuserdata/` are removed and listed in `.gitignore`. They remain in the
+git history; rewriting history to purge them would break existing clones,
+and they held only local paths, a username and a dev log.
 
 ## 6. Backups: encryption available; snapshots still unencrypted
 
