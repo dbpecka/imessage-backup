@@ -1667,14 +1667,24 @@
 
 <!-- ─── Orphan-clean modal (triggered by File > Clean Orphaned Data…) ─── -->
 {#if orphanModal !== null}
-  <div
-    class="modal-back"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Clean Orphaned Data"
-    onclick={closeOrphanModal}
-  >
-    <div class="modal-card" bind:this={orphanModalCard} onclick={(e) => e.stopPropagation()}>
+  <div class="modal-back">
+    <!-- Clicking outside the dialog closes it, like Escape. Not a tab stop:
+         keyboard users have Escape and the dialog's own buttons. -->
+    <button
+      type="button"
+      class="modal-dismiss"
+      tabindex="-1"
+      aria-label="Close"
+      onclick={closeOrphanModal}
+    ></button>
+    <div
+      class="modal-card"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Clean Orphaned Data"
+      tabindex="-1"
+      bind:this={orphanModalCard}
+    >
       <h3 class="modal-title">Clean Orphaned Data</h3>
 
       {#if orphanModal === 'scanning'}
@@ -1788,12 +1798,6 @@
 {/if}
 
 <style>
-  .lede {
-    color: var(--text-muted);
-    margin: 0 0 30px;
-    font-size: 14px;
-  }
-
   .card {
     margin-top: 18px;
     padding: 20px 22px;
@@ -1996,10 +2000,6 @@
     font-size: 12.5px;
     line-height: 1.2;
   }
-  .pill.ok {
-    background: var(--success-soft);
-    color: var(--success);
-  }
   .pill.err {
     background: var(--danger-soft);
     color: var(--danger);
@@ -2095,19 +2095,6 @@
     border-color: transparent;
   }
 
-  details {
-    margin-top: 24px;
-  }
-  details summary {
-    cursor: pointer;
-    color: var(--text-subtle);
-    padding: 6px 2px;
-    user-select: none;
-  }
-  details summary:hover {
-    color: var(--text-muted);
-  }
-
   .preview-counting {
     margin: 4px 0 0;
     opacity: 0.6;
@@ -2172,7 +2159,14 @@
     z-index: 100;
   }
 
+  .modal-dismiss {
+    all: unset;
+    position: absolute;
+    inset: 0;
+  }
+
   .modal-card {
+    position: relative;
     background: var(--surface);
     border: 1px solid var(--surface-ring);
     border-radius: var(--radius-lg);
