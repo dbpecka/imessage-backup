@@ -1,0 +1,51 @@
+name: Dependency audit
+
+# New advisories appear without any change here, so check on a schedule as
+# well as whenever the dependencies change.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays
+  push:
+    branches: [main]
+    paths:
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on vulnerabilities; "unmaintained"/"unsound" notices are
+      # printed as warnings. imessage-database comes from the fork pinned in
+      # Cargo.toml: a fix there means a new commit and a new pin.
+      - run: cargo audit
+        working-directory: src-tauri
+
+  npm:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm audit --audit-level=moderate

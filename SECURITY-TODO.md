@@ -49,6 +49,11 @@ vulnerabilities as of this change; the remaining `cargo audit` warnings
 are unmaintained or unsound crates deep in Tauri's dependency tree with no
 fix available.
 
+`.github/workflows/audit.yml` runs `cargo audit` and `npm audit` every
+Monday and whenever a lockfile changes, and `.github/dependabot.yml` opens
+weekly update PRs for npm and Cargo (monthly for GitHub Actions). Fixes to
+`imessage-database` itself have to go through the fork and a new pin.
+
 ## 4. Done: website serves only the site
 
 The site's files moved to `public/site/`, and `public/docker-compose.yml`

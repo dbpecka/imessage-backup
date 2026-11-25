@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # The Tauri JS packages must stay on the same minor version as the
+      # Rust tauri crates; update both sides together.
+      tauri:
+        patterns: ["@tauri-apps/*"]
+      frontend:
+        patterns: ["*"]
+        exclude-patterns: ["@tauri-apps/*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    groups:
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+      rust:
+        patterns: ["*"]
+        exclude-patterns: ["tauri", "tauri-*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
