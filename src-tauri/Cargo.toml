@@ -37,7 +37,7 @@ fs2 = "0.4"
 #
 #   [patch."https://github.com/dbpecka/imessage-exporter"]
 #   imessage-database = { path = "../../imessage-exporter/imessage-database" }
-imessage-database = { git = "https://github.com/dbpecka/imessage-exporter", rev = "92e37a339771cadba98d968aef260f3c533a8784", features = ["export", "write"] }
+imessage-database = { git = "https://github.com/dbpecka/imessage-exporter", rev = "faff56dfb555c8f28992bf2f568efb2253515780", features = ["export", "write"] }
 rusqlite = { version = "0.41", features = ["backup"] }
 
 [dev-dependencies]
