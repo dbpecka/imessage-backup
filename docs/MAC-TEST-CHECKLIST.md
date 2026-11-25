@@ -31,8 +31,9 @@ signed, notarized), and the result of each step.
       with Bubble Wrap already in the list.
 - [ ] Turn it on and return to the app: it asks to relaunch, relaunches, and
       shows the conversation list with contact names.
-- [ ] Revoke access while the app is open, then try a preview: the error is
-      understandable (known gap: it doesn't route back to the guide).
+- [ ] Revoke access while the app is open, then change a filter (or run a
+      backup, delete, orphan scan or restore): the app goes back to the Full
+      Disk Access step. Turn access back on: it asks to relaunch.
 
 ## 2. Signed build (entitlements removed)
 

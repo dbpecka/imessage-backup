@@ -306,6 +306,19 @@
     }
   });
 
+  // Full Disk Access can be revoked while the app is open. Whatever was
+  // running when that's noticed, go back to the permission step: it explains
+  // what to do, and re-checks when the user returns from System Settings.
+  function routeFdaError(err: unknown): boolean {
+    if (!isFdaError(err)) return false;
+    sawDenial = true;
+    fda = 'denied';
+    status = 'idle';
+    orphanModal = null;
+    window.scrollTo({ top: 0 });
+    return true;
+  }
+
   async function probe() {
     status = 'probing';
     detail = '';
@@ -318,12 +331,7 @@
       // SQLite opens via a different path than File::open, so it can still
       // report FDA denial even when the lightweight check succeeded. Route
       // back to the gate so the user gets the restart prompt.
-      if (isFdaError(err)) {
-        sawDenial = true;
-        fda = 'denied';
-        status = 'idle';
-        return;
-      }
+      if (routeFdaError(err)) return;
       status = 'error';
       detail = appErrorMessage(err);
     }
@@ -334,6 +342,7 @@
     try {
       chats = await api.listChats();
     } catch (err) {
+      if (routeFdaError(err)) return;
       detail = appErrorMessage(err);
     } finally {
       loadingChats = false;
@@ -345,6 +354,7 @@
     try {
       contacts = await api.listContacts();
     } catch (err) {
+      if (routeFdaError(err)) return;
       detail = appErrorMessage(err);
     } finally {
       loadingContacts = false;
@@ -397,6 +407,7 @@
         preview = result;
       }
     } catch (err) {
+      if (routeFdaError(err)) return;
       if (seq === previewSeq) {
         previewError = appErrorMessage(err);
         preview = null;
@@ -499,6 +510,7 @@
         encryptPassword: encryptBackup ? backupPassword : undefined
       });
     } catch (err) {
+      if (routeFdaError(err)) return;
       runError = appErrorMessage(err);
     } finally {
       running = false;
@@ -520,6 +532,7 @@
       safety = await api.safetyStatus();
       return true;
     } catch (err) {
+      if (routeFdaError(err)) return false;
       deleteError = appErrorMessage(err);
       safety = null;
       return false;
@@ -538,6 +551,7 @@
     try {
       snapshots = await api.listSnapshots();
     } catch (err) {
+      if (routeFdaError(err)) return;
       restoreError = appErrorMessage(err);
     }
   }
@@ -578,6 +592,7 @@
       restoreResult = await api.restoreSnapshot(snap.path, icloudOn);
       await Promise.all([loadSnapshots(), runPreview(), runDeletePreview(), loadChats()]);
     } catch (err) {
+      if (routeFdaError(err)) return;
       restoreError = appErrorMessage(err);
     } finally {
       restoring = false;
@@ -612,6 +627,7 @@
         deletePreviewFilterKey = JSON.stringify(filter);
       }
     } catch (err) {
+      if (routeFdaError(err)) return;
       if (seq === deletePreviewSeq) {
         deleteError = appErrorMessage(err);
         deletePreview = null;
@@ -717,6 +733,7 @@
       typedConfirmation = '';
       await Promise.all([runPreview(), runDeletePreview(), loadChats(), loadSnapshots()]);
     } catch (err) {
+      if (routeFdaError(err)) return;
       deleteError = appErrorMessage(err);
       // The backend refuses when what it would delete no longer matches the
       // preview or the backup (e.g. a message just arrived). Refresh both so
@@ -772,6 +789,7 @@
       orphanScan = await api.scanOrphans(includeRetained);
       orphanModal = 'preview';
     } catch (err) {
+      if (routeFdaError(err)) return;
       orphanError = appErrorMessage(err);
       orphanModal = 'error';
     }
@@ -789,6 +807,7 @@
       );
       orphanModal = 'done';
     } catch (err) {
+      if (routeFdaError(err)) return;
       orphanError = appErrorMessage(err);
       orphanModal = 'error';
     }

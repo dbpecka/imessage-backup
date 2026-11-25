@@ -77,13 +77,89 @@ pub fn open_write(path: &Path) -> Result<Connection, AppError> {
     Ok(conn)
 }
 
+/// Whether macOS is refusing this process access to `path` — what happens
+/// to everything in `~/Library/Messages` without Full Disk Access. TCC
+/// refuses even to stat the file, so a missing file isn't a denial.
+pub fn access_denied(path: &Path) -> bool {
+    let denied = |e: std::io::Error| e.kind() == std::io::ErrorKind::PermissionDenied;
+    match std::fs::metadata(path) {
+        Ok(_) => std::fs::File::open(path).err().is_some_and(denied),
+        Err(e) => denied(e),
+    }
+}
+
+/// Report `err` as a Full Disk Access problem if access to chat.db is being
+/// refused right now. Access can be revoked while the app is open; the
+/// operation then fails with whatever it tripped over first ("Operation not
+/// permitted", "unable to open database file", …), which doesn't tell the
+/// user what to do.
+pub fn explain_access_error(err: AppError) -> AppError {
+    if matches!(err, AppError::FullDiskAccess { .. }) {
+        return err;
+    }
+    match default_chat_db_path() {
+        Ok(path) if access_denied(&path) => AppError::FullDiskAccess {
+            path: path.display().to_string(),
+        },
+        _ => err,
+    }
+}
+
 /// Run blocking work (SQLite, filesystem walks) off the async runtime.
+/// Failures caused by a revoked Full Disk Access are reported as such.
 pub async fn blocking<T, F>(f: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    tokio::task::spawn_blocking(move || f().map_err(explain_access_error))
         .await
         .map_err(|e| AppError::Other(format!("background task failed: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without Full Disk Access, macOS refuses to stat anything in
+    /// `~/Library/Messages`. A folder we can't search stands in for that.
+    #[cfg(unix)]
+    #[test]
+    fn failures_while_access_is_refused_are_reported_as_full_disk_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let messages = home.path().join("Library/Messages");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(messages.join("chat.db"), b"").unwrap();
+        set_test_home(Some(home.path().to_path_buf()));
+
+        let other = || AppError::Io("Operation not permitted (os error 1)".into());
+        // Access granted: errors pass through unchanged.
+        assert!(matches!(explain_access_error(other()), AppError::Io(_)));
+
+        std::fs::set_permissions(&messages, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::metadata(messages.join("chat.db")).is_err();
+        let err = explain_access_error(other());
+        std::fs::set_permissions(&messages, std::fs::Permissions::from_mode(0o755)).unwrap();
+        set_test_home(None);
+
+        // Root ignores folder permissions, so this half only runs as a
+        // normal user (as on CI).
+        if refused {
+            assert!(
+                matches!(err, AppError::FullDiskAccess { ref path } if path.ends_with("chat.db")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_chat_db_is_not_an_access_problem() {
+        let home = tempfile::TempDir::new().unwrap();
+        set_test_home(Some(home.path().to_path_buf()));
+        let err = explain_access_error(AppError::Other("boom".into()));
+        set_test_home(None);
+        assert!(matches!(err, AppError::Other(m) if m == "boom"));
+    }
 }
