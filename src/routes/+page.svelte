@@ -546,10 +546,17 @@
   let restoring = $state(false);
   let restoreError = $state('');
   let restoreResult = $state<RestoreResult | null>(null);
+  // How long snapshots are kept, in days; null = until replaced; undefined
+  // until loaded.
+  let snapshotRetentionDays = $state<number | null | undefined>(undefined);
+  let deletingSnapshot = $state(false);
 
   async function loadSnapshots() {
     try {
-      snapshots = await api.listSnapshots();
+      [snapshots, snapshotRetentionDays] = await Promise.all([
+        api.listSnapshots(),
+        api.getSnapshotRetention()
+      ]);
     } catch (err) {
       if (routeFdaError(err)) return;
       restoreError = appErrorMessage(err);
@@ -561,6 +568,43 @@
     orphanClean: 'Before an orphan cleanup',
     preRestore: 'Before a restore'
   };
+
+  async function changeSnapshotRetention(select: HTMLSelectElement) {
+    restoreError = '';
+    const days = select.value === 'never' ? null : Number(select.value);
+    try {
+      await api.setSnapshotRetention(days);
+      snapshotRetentionDays = days;
+      // Shortening the period removes snapshots that are now too old.
+      snapshots = await api.listSnapshots();
+    } catch (err) {
+      select.value = String(snapshotRetentionDays ?? 'never');
+      if (routeFdaError(err)) return;
+      restoreError = appErrorMessage(err);
+    }
+  }
+
+  async function deleteSnapshot(snap: SnapshotInfo) {
+    restoreError = '';
+    restoreResult = null;
+    const when = new Date(snap.takenAtUnix * 1000).toLocaleString();
+    const confirmed = await confirm(
+      `Delete the snapshot from ${when}?\n\nYou won't be able to restore the Messages ` +
+        'database to that point.',
+      { title: 'Delete Snapshot', kind: 'warning' }
+    );
+    if (!confirmed) return;
+    deletingSnapshot = true;
+    try {
+      await api.deleteSnapshot(snap.path);
+      await loadSnapshots();
+    } catch (err) {
+      if (routeFdaError(err)) return;
+      restoreError = appErrorMessage(err);
+    } finally {
+      deletingSnapshot = false;
+    }
+  }
 
   async function restoreSnapshot(snap: SnapshotInfo) {
     restoreError = '';
@@ -1533,6 +1577,29 @@
           A copy of the Messages database is saved before every delete and cleanup. Restoring one
           brings back the messages it holds; attachment files come back only from your backup.
         </p>
+        {#if snapshotRetentionDays !== undefined}
+          <label class="retention">
+            Keep snapshots for
+            <select
+              value={String(snapshotRetentionDays ?? 'never')}
+              onchange={(e) => changeSnapshotRetention(e.currentTarget)}
+              disabled={restoring || deleting || deletingSnapshot}
+            >
+              {#if snapshotRetentionDays !== null && ![7, 30, 90].includes(snapshotRetentionDays)}
+                <option value={String(snapshotRetentionDays)}>{snapshotRetentionDays} days</option>
+              {/if}
+              <option value="7">1 week</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+              <option value="never">until replaced</option>
+            </select>
+          </label>
+          <p class="meta">
+            Snapshots are full, unencrypted copies of your message history, kept in the app's own
+            data folder (not synced). Only the 5 newest of each kind are kept, and older ones are
+            removed after this period.
+          </p>
+        {/if}
         {#if snapshots === null}
           <p class="meta">Loading…</p>
         {:else if snapshots.length === 0}
@@ -1545,9 +1612,20 @@
                   <strong>{new Date(snap.takenAtUnix * 1000).toLocaleString()}</strong>
                   · {snapshotKindLabel[snap.kind]} · {formatBytes(snap.bytes)}
                 </span>
-                <button onclick={() => restoreSnapshot(snap)} disabled={restoring || deleting}>
-                  {restoring ? 'Restoring…' : 'Restore'}
-                </button>
+                <span class="snapshot-actions">
+                  <button
+                    onclick={() => restoreSnapshot(snap)}
+                    disabled={restoring || deleting || deletingSnapshot}
+                  >
+                    {restoring ? 'Restoring…' : 'Restore'}
+                  </button>
+                  <button
+                    onclick={() => deleteSnapshot(snap)}
+                    disabled={restoring || deleting || deletingSnapshot}
+                  >
+                    Delete
+                  </button>
+                </span>
               </li>
             {/each}
           </ul>
@@ -2118,6 +2196,19 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+  }
+
+  .snapshot-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .retention {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 0;
   }
 
   .orphan-rows {

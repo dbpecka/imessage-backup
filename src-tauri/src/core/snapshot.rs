@@ -1,6 +1,8 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, SystemTime},
 };
 
 use rusqlite::{backup::Backup, Connection, OpenFlags};
@@ -155,8 +157,38 @@ pub const SNAPSHOTS_TO_KEEP: usize = 5;
 /// considered. Returns how many were removed; failures are logged and
 /// skipped since pruning is housekeeping, not part of the safety contract.
 pub fn prune_snapshots(root: &Path, keep: usize, just_taken: &Path) -> usize {
+    let dirs = snapshot_dirs(root);
+    let excess = dirs.len().saturating_sub(keep);
+    let mut removed = 0;
+    for (_, dir) in dirs.into_iter().take(excess) {
+        // Never prune the snapshot protecting the operation in progress.
+        if dir == just_taken {
+            continue;
+        }
+        if remove_snapshot_dir(&dir) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Remove snapshot folders under `root` written more than `max_age` before
+/// `now`. Snapshots are full copies of the message history, so they
+/// shouldn't outlive their usefulness as an undo. A snapshot dated in the
+/// future (clock changes) counts as new. Returns how many were removed.
+pub fn expire_snapshots(root: &Path, max_age: Duration, now: SystemTime) -> usize {
+    snapshot_dirs(root)
+        .into_iter()
+        .filter(|((written, _, _), _)| now.duration_since(*written).is_ok_and(|age| age > max_age))
+        .filter(|(_, dir)| remove_snapshot_dir(dir))
+        .count()
+}
+
+/// Snapshot folders this module created under `root` (timestamp-named,
+/// containing `chat.db`), oldest first.
+fn snapshot_dirs(root: &Path) -> Vec<(SortKey, PathBuf)> {
     let Ok(entries) = fs::read_dir(root) else {
-        return 0;
+        return Vec::new();
     };
     let mut dirs: Vec<(SortKey, PathBuf)> = entries
         .flatten()
@@ -173,26 +205,108 @@ pub fn prune_snapshots(root: &Path, keep: usize, just_taken: &Path) -> usize {
         })
         .collect();
     dirs.sort();
-    let excess = dirs.len().saturating_sub(keep);
-    let mut removed = 0;
-    for (_, dir) in dirs.into_iter().take(excess) {
-        // Never prune the snapshot protecting the operation in progress.
-        if dir == just_taken {
-            continue;
-        }
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => removed += 1,
-            Err(e) => eprintln!("snapshot: failed to prune {}: {e}", dir.display()),
+    dirs
+}
+
+fn remove_snapshot_dir(dir: &Path) -> bool {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("snapshot: failed to remove {}: {e}", dir.display());
+            false
         }
     }
-    removed
 }
 
 /// (write time, timestamp part of the name, numeric `-N` suffix).
-type SortKey = (std::time::SystemTime, String, u32);
+type SortKey = (SystemTime, String, u32);
 
-/// For a snapshot folder name (`YYYY-MM-DDTHH-MM-SS` plus an optional
-/// `-N`), the numeric suffix (0 if none); `None` for other names.
+/// How long snapshots are kept before [`expire_snapshots`] removes them.
+/// Persisted in the app's data folder; `None` means "until replaced" (only
+/// the newest [`SNAPSHOTS_TO_KEEP`] of each kind are kept either way).
+pub struct SnapshotRetention {
+    max_age_days: Mutex<Option<u32>>,
+    path: Option<PathBuf>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetentionFile {
+    max_age_days: Option<u32>,
+}
+
+impl SnapshotRetention {
+    pub const DEFAULT_DAYS: u32 = 30;
+    /// Longest period the setting accepts.
+    pub const MAX_DAYS: u32 = 3650;
+
+    /// Load the setting saved at `path`, or the default if there is none.
+    pub fn persistent(path: PathBuf) -> Self {
+        let saved = fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<RetentionFile>(&b).ok())
+            .map_or(Some(Self::DEFAULT_DAYS), |f| f.max_age_days);
+        Self {
+            max_age_days: Mutex::new(saved),
+            path: Some(path),
+        }
+    }
+
+    pub fn max_age_days(&self) -> Option<u32> {
+        *self.max_age_days.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn max_age(&self) -> Option<Duration> {
+        self.max_age_days()
+            .map(|d| Duration::from_secs(u64::from(d) * 24 * 60 * 60))
+    }
+
+    pub fn set(&self, days: Option<u32>) -> Result<(), AppError> {
+        if days.is_some_and(|d| d == 0 || d > Self::MAX_DAYS) {
+            return Err(AppError::Other(format!(
+                "Keep snapshots for between 1 and {} days.",
+                Self::MAX_DAYS
+            )));
+        }
+        if let Some(path) = &self.path {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            fs::write(
+                &tmp,
+                serde_json::to_vec(&RetentionFile { max_age_days: days })
+                    .map_err(|e| AppError::Other(e.to_string()))?,
+            )?;
+            fs::rename(&tmp, path)?;
+        }
+        *self.max_age_days.lock().unwrap_or_else(|p| p.into_inner()) = days;
+        Ok(())
+    }
+
+    /// Remove the snapshots under `roots` that are older than the setting.
+    pub fn expire(&self, roots: &[(SnapshotKind, PathBuf)]) -> usize {
+        let Some(max_age) = self.max_age() else {
+            return 0;
+        };
+        let now = SystemTime::now();
+        roots
+            .iter()
+            .map(|(_, root)| expire_snapshots(root, max_age, now))
+            .sum()
+    }
+}
+
+impl Default for SnapshotRetention {
+    /// The default period, not saved anywhere (tests, or no data folder).
+    fn default() -> Self {
+        Self {
+            max_age_days: Mutex::new(Some(Self::DEFAULT_DAYS)),
+            path: None,
+        }
+    }
+}
+
 /// A snapshot folder found on disk.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,6 +360,8 @@ pub fn list_snapshots(roots: &[(SnapshotKind, PathBuf)]) -> Vec<SnapshotInfo> {
     out
 }
 
+/// For a snapshot folder name (`YYYY-MM-DDTHH-MM-SS` plus an optional
+/// `-N`), the numeric suffix (0 if none); `None` for other names.
 fn snapshot_suffix(name: &str) -> Option<u32> {
     if !is_snapshot_name(name) {
         return None;
@@ -405,6 +521,79 @@ mod tests {
         // Even with keep = 0 the just-taken snapshot is never removed.
         assert_eq!(prune_snapshots(root, 0, &newest), 1);
         assert!(newest.exists());
+    }
+
+    /// A snapshot folder `root/name` whose chat.db was written `age` ago.
+    fn snapshot_aged(root: &Path, name: &str, age: Duration) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("chat.db");
+        fs::write(&db, b"x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        dir
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    #[test]
+    fn expiry_removes_only_old_snapshots_of_ours() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let old = snapshot_aged(root, "2024-01-01T00-00-00", 40 * DAY);
+        let old_too = snapshot_aged(root, "2024-01-01T00-00-00-1", 31 * DAY);
+        let recent = snapshot_aged(root, "2024-02-01T00-00-00", 29 * DAY);
+        // Not ours, however old.
+        let foreign = snapshot_aged(root, "my-notes", 400 * DAY);
+
+        assert_eq!(expire_snapshots(root, 30 * DAY, SystemTime::now()), 2);
+        assert!(!old.exists());
+        assert!(!old_too.exists());
+        assert!(recent.exists());
+        assert!(foreign.exists());
+    }
+
+    #[test]
+    fn a_snapshot_dated_in_the_future_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let dir = snapshot_aged(tmp.path(), "2024-01-01T00-00-00", Duration::ZERO);
+        let long_ago = SystemTime::now() - 365 * DAY;
+        assert_eq!(expire_snapshots(tmp.path(), DAY, long_ago), 0);
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn retention_setting_is_saved_and_applied() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("settings/snapshot_settings.json");
+        let root = tmp.path().join("snaps");
+        let roots = [(SnapshotKind::Delete, root.clone())];
+        let week_old = snapshot_aged(&root, "2024-01-01T00-00-00", 8 * DAY);
+
+        // Default: 30 days.
+        let r = SnapshotRetention::persistent(file.clone());
+        assert_eq!(r.max_age_days(), Some(SnapshotRetention::DEFAULT_DAYS));
+        assert_eq!(r.expire(&roots), 0);
+
+        // "Until replaced" survives a relaunch and expires nothing.
+        r.set(None).unwrap();
+        let r = SnapshotRetention::persistent(file.clone());
+        assert_eq!(r.max_age_days(), None);
+        assert_eq!(r.expire(&roots), 0);
+        assert!(week_old.exists());
+
+        r.set(Some(7)).unwrap();
+        assert_eq!(SnapshotRetention::persistent(file).max_age_days(), Some(7));
+        assert_eq!(r.expire(&roots), 1);
+        assert!(!week_old.exists());
+
+        assert!(r.set(Some(0)).is_err());
+        assert!(r.set(Some(SnapshotRetention::MAX_DAYS + 1)).is_err());
+        assert_eq!(r.max_age_days(), Some(7), "a refused value changes nothing");
     }
 
     #[test]

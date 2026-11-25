@@ -71,10 +71,15 @@ warning for `/Volumes/…`, iCloud Drive, and Desktop/Documents destinations.
 Snapshots live in `~/Library/Application Support/<app>/` (not synced), five
 kept per kind.
 
-**Still to do:** snapshots are not encrypted (they're needed for restore
-without a password prompt); consider encrypting them at rest or expiring
-them after a configurable period. Verify the real `hdiutil` flow on a Mac
-(`docs/MAC-TEST-CHECKLIST.md`, section 4) — tests use a stand-in.
+**Done:** snapshots expire. They're removed after 30 days by default
+(1 week, 90 days, or "until replaced" in the Restore section), at launch,
+after each delete, cleanup or restore, and when the setting changes. Any
+snapshot can also be deleted from that list.
+
+**Still to do:** snapshots are not encrypted, so they can be restored
+without a password prompt; encrypting them at rest would need one.
+Verify the real `hdiutil` flow on a Mac (`docs/MAC-TEST-CHECKLIST.md`,
+section 4) — tests use a stand-in.
 
 ## 7. Removed: unused shell plugin
 

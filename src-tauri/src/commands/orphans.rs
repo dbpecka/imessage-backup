@@ -418,8 +418,12 @@ pub async fn clean_orphans(
     let _guard = lock.try_acquire("a cleanup")?;
     let store = RetainedAttachments::for_app(&app)?;
     let snapshot_root = default_snapshot_root(&app, SnapshotKind::OrphanClean)?;
-    blocking(move || clean_orphans_blocking(&store, &snapshot_root, &args, &SafetyProbe::system()))
-        .await
+    let result = blocking(move || {
+        clean_orphans_blocking(&store, &snapshot_root, &args, &SafetyProbe::system())
+    })
+    .await?;
+    crate::commands::restore::expire_old_snapshots(&app).await;
+    Ok(result)
 }
 
 pub(crate) fn clean_orphans_blocking(

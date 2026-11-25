@@ -1127,3 +1127,28 @@ fn encrypted_backup_goes_into_an_image_that_counts_for_delete() {
         .attach(&image, &mp, &Password::new("wrong password"))
         .is_err());
 }
+
+#[test]
+fn a_snapshot_can_be_deleted_but_nothing_else_can() {
+    let env = Env::new();
+    let r = env.delete(chat(2), DeleteScope::Both, true).unwrap();
+    let roots = snapshot_roots(&env);
+
+    // Not ours: refused, and left alone.
+    let elsewhere = env.home.join("Downloads/2024-01-01T00-00-00");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::copy(&env.db, elsewhere.join("chat.db")).unwrap();
+    for path in [
+        elsewhere.to_str().unwrap(),
+        env.db.parent().unwrap().to_str().unwrap(),
+    ] {
+        let err = crate::commands::restore::delete_snapshot_now(&roots, path).unwrap_err();
+        assert!(matches!(err, AppError::Other(m) if m.contains("isn't a Bubble Wrap snapshot")));
+    }
+    assert!(elsewhere.join("chat.db").exists());
+    assert!(env.db.exists());
+
+    crate::commands::restore::delete_snapshot_now(&roots, &r.snapshot_path).unwrap();
+    assert!(!Path::new(&r.snapshot_path).exists());
+    assert!(crate::core::snapshot::list_snapshots(&roots).is_empty());
+}

@@ -25,6 +25,25 @@ pub fn run() {
             };
             app.manage(std::sync::Arc::new(receipts));
 
+            let retention = match app.path().app_data_dir() {
+                Ok(dir) => core::snapshot::SnapshotRetention::persistent(
+                    dir.join("snapshot_settings.json"),
+                ),
+                Err(_) => core::snapshot::SnapshotRetention::default(),
+            };
+            app.manage(std::sync::Arc::new(retention));
+            // Remove snapshots that expired while the app was closed.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let lock = handle
+                    .state::<core::op_lock::OperationLock>()
+                    .inner()
+                    .clone();
+                if let Ok(_guard) = lock.try_acquire("a snapshot cleanup") {
+                    commands::restore::expire_old_snapshots(&handle).await;
+                }
+            });
+
             let clean_item =
                 MenuItemBuilder::with_id("clean-orphans", "Clean Orphaned Data…").build(app)?;
 
@@ -86,6 +105,9 @@ pub fn run() {
             commands::orphans::clean_orphans,
             commands::restore::list_snapshots,
             commands::restore::restore_snapshot,
+            commands::restore::delete_snapshot,
+            commands::restore::get_snapshot_retention,
+            commands::restore::set_snapshot_retention,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

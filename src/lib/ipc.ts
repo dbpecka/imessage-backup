@@ -268,6 +268,12 @@ export const api = {
   listSnapshots: () => invoke<SnapshotInfo[]>('list_snapshots'),
   restoreSnapshot: (snapshotPath: string, acknowledgeIcloudSync: boolean) =>
     invoke<RestoreResult>('restore_snapshot', { args: { snapshotPath, acknowledgeIcloudSync } }),
+  deleteSnapshot: (snapshotPath: string) =>
+    invoke<void>('delete_snapshot', { args: { snapshotPath } }),
+  /** Days snapshots are kept; null = until replaced. */
+  getSnapshotRetention: () => invoke<number | null>('get_snapshot_retention'),
+  setSnapshotRetention: (days: number | null) =>
+    invoke<void>('set_snapshot_retention', { days }),
   scanOrphans: (includeRetained = false) =>
     invoke<OrphanScan>('scan_orphans', { includeRetained }),
   cleanOrphans: (scanFingerprint: string, includeRetained = false, acknowledgeIcloudSync = false) =>

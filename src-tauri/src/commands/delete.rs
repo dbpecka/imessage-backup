@@ -664,7 +664,7 @@ pub async fn run_delete(
         _ => (default_snapshot_root(&app, SnapshotKind::Delete)?, true),
     };
     let receipts = Arc::clone(&receipts);
-    blocking(move || {
+    let result = blocking(move || {
         delete_now(
             &db_path,
             &receipts,
@@ -674,7 +674,9 @@ pub async fn run_delete(
             &SafetyProbe::system(),
         )
     })
-    .await
+    .await?;
+    crate::commands::restore::expire_old_snapshots(&app).await;
+    Ok(result)
 }
 
 /// The whole delete, gates included, as a plain function (see

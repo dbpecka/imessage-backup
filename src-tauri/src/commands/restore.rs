@@ -1,10 +1,11 @@
 //! Restore chat.db from a snapshot taken before a delete or cleanup.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::delete::SafetyProbe;
 use crate::core::db_path::{blocking, default_chat_db_path, open_write};
@@ -12,12 +13,12 @@ use crate::core::icloud::ICloudState;
 use crate::core::op_lock::OperationLock;
 use crate::core::snapshot::{
     checkpoint_wal, default_snapshot_root, list_snapshots as find_snapshots, prune_snapshots,
-    snapshot_chat_db, SnapshotInfo, SnapshotKind, SNAPSHOTS_TO_KEEP,
+    snapshot_chat_db, SnapshotInfo, SnapshotKind, SnapshotRetention, SNAPSHOTS_TO_KEEP,
 };
 use crate::core::space::{ensure_space, snapshot_size};
 use crate::error::AppError;
 
-fn snapshot_roots(app: &AppHandle) -> Result<Vec<(SnapshotKind, PathBuf)>, AppError> {
+pub(crate) fn snapshot_roots(app: &AppHandle) -> Result<Vec<(SnapshotKind, PathBuf)>, AppError> {
     SnapshotKind::ALL
         .iter()
         .map(|k| Ok((*k, default_snapshot_root(app, *k)?)))
@@ -29,6 +30,68 @@ fn snapshot_roots(app: &AppHandle) -> Result<Vec<(SnapshotKind, PathBuf)>, AppEr
 pub async fn list_snapshots(app: AppHandle) -> Result<Vec<SnapshotInfo>, AppError> {
     let roots = snapshot_roots(&app)?;
     blocking(move || Ok(find_snapshots(&roots))).await
+}
+
+/// Remove snapshots older than the retention setting. Housekeeping: a
+/// failure is logged, never reported. Call with the operation lock held, so
+/// a restore can't be reading a snapshot this removes.
+pub(crate) async fn expire_old_snapshots(app: &AppHandle) {
+    let Ok(roots) = snapshot_roots(app) else {
+        return;
+    };
+    let retention = Arc::clone(&app.state::<Arc<SnapshotRetention>>());
+    let _ = tokio::task::spawn_blocking(move || retention.expire(&roots)).await;
+}
+
+/// How many days snapshots are kept; `None` means until replaced.
+#[tauri::command]
+pub fn get_snapshot_retention(retention: State<'_, Arc<SnapshotRetention>>) -> Option<u32> {
+    retention.max_age_days()
+}
+
+/// Change how long snapshots are kept, and remove any that are now too old.
+#[tauri::command]
+pub async fn set_snapshot_retention(
+    app: AppHandle,
+    retention: State<'_, Arc<SnapshotRetention>>,
+    lock: State<'_, OperationLock>,
+    days: Option<u32>,
+) -> Result<(), AppError> {
+    retention.set(days)?;
+    // If something is running, its own expiry pass applies the new setting
+    // when it finishes.
+    if let Ok(_guard) = lock.try_acquire("a snapshot cleanup") {
+        expire_old_snapshots(&app).await;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSnapshotArgs {
+    /// A `path` from [`list_snapshots`].
+    pub snapshot_path: String,
+}
+
+/// Delete one snapshot now.
+#[tauri::command]
+pub async fn delete_snapshot(
+    app: AppHandle,
+    lock: State<'_, OperationLock>,
+    args: DeleteSnapshotArgs,
+) -> Result<(), AppError> {
+    let _guard = lock.try_acquire("deleting a snapshot")?;
+    let roots = snapshot_roots(&app)?;
+    blocking(move || delete_snapshot_now(&roots, &args.snapshot_path)).await
+}
+
+pub(crate) fn delete_snapshot_now(
+    roots: &[(SnapshotKind, PathBuf)],
+    snapshot_path: &str,
+) -> Result<(), AppError> {
+    let dir = resolve_snapshot(snapshot_path, roots)?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +124,10 @@ pub async fn restore_snapshot(
     let _guard = lock.try_acquire("a restore")?;
     let db_path = default_chat_db_path()?;
     let roots = snapshot_roots(&app)?;
-    blocking(move || restore_now(&db_path, &roots, &args, &SafetyProbe::system())).await
+    let result =
+        blocking(move || restore_now(&db_path, &roots, &args, &SafetyProbe::system())).await?;
+    expire_old_snapshots(&app).await;
+    Ok(result)
 }
 
 /// The snapshot folder, if it is one this app created: directly inside one

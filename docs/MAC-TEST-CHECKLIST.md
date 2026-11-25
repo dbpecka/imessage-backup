@@ -103,6 +103,12 @@ For each format (JSON, HTML, TXT; PDF last):
       deleted messages are back.
 - [ ] A pre-restore snapshot of the state just before the restore exists.
 - [ ] Restoring while Messages is running is refused.
+- [ ] Delete a snapshot from the list: it's gone from the list and from
+      `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/`.
+- [ ] Expiry: in Terminal, backdate a snapshot
+      (`touch -t 202001010000 …/snapshots/delete/<folder>/chat.db`), then
+      relaunch the app: that snapshot is gone. Set "Keep snapshots for" to
+      "until replaced", backdate another, relaunch: it stays.
 
 ## 7. Messages in iCloud (two devices, throwaway Apple ID)
 

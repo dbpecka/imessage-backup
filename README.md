@@ -67,7 +67,7 @@ A **File > Clean Orphaned Data…** menu item opens a modal that scans for and r
 3. `pgrep -x Messages` must return empty (Messages.app must be closed)
 4. If Messages-in-iCloud is detected as **Enabled**, `acknowledge_icloud_sync=true` is required
 5. `PRAGMA wal_checkpoint(TRUNCATE)` flushes the WAL on the source DB
-6. Atomic snapshot of `chat.db` via SQLite's online backup API written to `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/delete/<ISO-timestamp>/` (orphan cleanups use `snapshots/orphan-clean/`; the 5 most recent of each are kept)
+6. Atomic snapshot of `chat.db` via SQLite's online backup API written to `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/delete/<ISO-timestamp>/` (orphan cleanups use `snapshots/orphan-clean/`; the 5 most recent of each are kept, and snapshots are removed after 30 days by default — configurable, or kept until replaced)
 7. Delete plan built on a read-only connection, then applied on a separate writable connection
 8. Writable connection released immediately after commit
 9. Attachment files unlinked after the SQL transaction; failures are logged to stderr with path + reason but are non-fatal
@@ -181,7 +181,9 @@ dbpecka/imessage-exporter  — the fork (git dependency, pinned)
 
 Every delete and orphan cleanup first saves a copy of `chat.db` to
 `~/Library/Application Support/io.pecka.apps.bubblewrap/snapshots/<delete|orphan-clean>/<timestamp>/`.
-To roll back:
+The app can restore one for you (Delete step → "Restore a snapshot"), where
+you can also delete snapshots and choose how long they're kept (30 days by
+default). To roll back by hand:
 
 1. Quit Messages (and make sure it stays quit).
 2. Replace `~/Library/Messages/chat.db` with the snapshot's `chat.db`.
@@ -190,4 +192,5 @@ To roll back:
 
 Snapshots only contain the database. Attachment files removed by a delete
 are not in the snapshot — restore them from your backup's `attachments/`
-folder. Backups and snapshots are not encrypted.
+folder. Snapshots are not encrypted; backups are only if you choose to
+encrypt them.
